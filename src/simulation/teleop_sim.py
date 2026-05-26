@@ -10,6 +10,7 @@ import torch
 import sapien
 import argparse
 from mani_skill.utils import sapien_utils
+from mani_skill.utils.building import actors
 
 
 class ServoTeleoperatorSim: 
@@ -19,13 +20,17 @@ class ServoTeleoperatorSim:
     Supported robot arm types: arx-x5, so100, xarm6_robotiq, panda, x_fetch, unitree_h1
     """
     
-    def __init__(self, scene: str, robot_uids: str, serial_port: str = '/dev/ttyUSB0'):
+    def __init__(self, scene: str, robot_uids: str, serial_port: str = '/dev/ttyUSB0',
+                 object_pos=None, object_size: float = 0.04, spawn_object: bool = True):
         """Initialize teleoperation system
         
         Args:
             scene: Simulation scene name
             robot_uids: Robot arm type identifier
             serial_port: Serial port device path
+            object_pos: Position of the grasp object center [x, y, z]
+            object_size: Edge length of the grasp object
+            spawn_object: Whether to spawn a grasp object
         """
         # Serial port configuration
         self.SERIAL_PORT = serial_port
@@ -36,6 +41,10 @@ class ServoTeleoperatorSim:
         self.scene = scene
         self.robot_uids = robot_uids
         self.gripper_range = 0.43
+        self.object_pos = object_pos if object_pos is not None else [0.606, -1.48, 0.66]
+        self.object_size = object_size
+        self.spawn_object = spawn_object
+        self.grasp_object = None
         self.zero_angles = [0.0] * 7  # Initial calibration angles for servos
         self.sim_init_angles = [0.0] * 7  # Simulation initial angles
         self.stop_event = Event()
@@ -74,6 +83,8 @@ class ServoTeleoperatorSim:
         )
         obs, _ = self.env.reset(seed=0)
         print("Action space:", self.env.action_space)
+        if self.spawn_object:
+            self._spawn_grasp_object()
         
         # Set initial standing pose for H1
         if robot_uids == "unitree_h1":
@@ -112,6 +123,22 @@ class ServoTeleoperatorSim:
             camera_position = camera_pose_arr[:3]
             camera_quaternion = camera_pose_arr[3:]
             camera_viewer.set_camera_pose(sapien.Pose(camera_position, camera_quaternion))
+
+    def _spawn_grasp_object(self):
+        """Spawn a simple dynamic cube for teleoperation grasp tests."""
+        half_size = self.object_size / 2.0
+        self.grasp_object = actors.build_cube(
+            self.env.unwrapped.scene,
+            half_size=half_size,
+            color=[1, 0, 0, 1],
+            name="teleop_cube",
+            body_type="dynamic",
+            initial_pose=sapien.Pose(p=self.object_pos),
+        )
+        print(
+            f"Spawned grasp object 'teleop_cube' at {self.object_pos} "
+            f"with size {self.object_size} m"
+        )
 
     def _setup_h1_standing_pose(self):
         """Set initial standing pose for H1 robot"""
@@ -480,6 +507,25 @@ if __name__ == "__main__":
         default='/dev/ttyUSB0',
         help='Serial port device path'
     )
+    parser.add_argument(
+        '--object-pos',
+        type=float,
+        nargs=3,
+        metavar=('X', 'Y', 'Z'),
+        default=[0.606, -1.48, 1.66],
+        help='Grasp object center position in world coordinates'
+    )
+    parser.add_argument(
+        '--object-size',
+        type=float,
+        default=0.04,
+        help='Grasp object edge length in meters'
+    )
+    parser.add_argument(
+        '--no-object',
+        action='store_true',
+        help='Disable spawning the grasp object'
+    )
     
     args = parser.parse_args()
     
@@ -491,11 +537,23 @@ if __name__ == "__main__":
     print(f"Simulation scene:   {args.scene}")
     print(f"Control frequency:   {args.rate} Hz")
     print(f"Serial device:   {args.serial_port}")
+    if args.no_object:
+        print("Grasp object:     disabled")
+    else:
+        print(f"Grasp object pos: {args.object_pos}")
+        print(f"Grasp object size: {args.object_size} m")
     print("-" * 60)
     
     # Create and run simulation instance
     try:
-        sim = ServoTeleoperatorSim(scene=args.scene, robot_uids=args.robot, serial_port=args.serial_port)
+        sim = ServoTeleoperatorSim(
+            scene=args.scene,
+            robot_uids=args.robot,
+            serial_port=args.serial_port,
+            object_pos=args.object_pos,
+            object_size=args.object_size,
+            spawn_object=not args.no_object,
+        )
         sim.rate = args.rate
         sim.run()
     except Exception as e:
