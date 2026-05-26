@@ -35,7 +35,7 @@ class ServoTeleoperatorSim:
         # System configuration
         self.scene = scene
         self.robot_uids = robot_uids
-        self.gripper_range = 0.48
+        self.gripper_range = 0.43
         self.zero_angles = [0.0] * 7  # Initial calibration angles for servos
         self.sim_init_angles = [0.0] * 7  # Simulation initial angles
         self.stop_event = Event()
@@ -252,10 +252,11 @@ class ServoTeleoperatorSim:
         
         elif self.robot_uids == "piper":  # 6-axis robot arm + dual-finger gripper
             action = np.array(pose)
-            action[-1] = self.angle_to_gripper(action[-1], 0, 0.04)
+            press_ratio = np.clip(-action[-1] / np.radians(48), 0.0, 1.0)
+            action[-1] = float(0.04 * (1.0 - press_ratio))
 
             action = np.concatenate([action, [action[-1]]])
-            action[3], action[4] = action[4], -action[3]  # Swap joints 4 and 5
+            action[4] = -action[4]
 
         elif self.robot_uids == "so100":  # 5-axis robot arm
             pose_copy = pose.copy()
