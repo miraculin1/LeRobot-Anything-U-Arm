@@ -61,17 +61,20 @@ class ServoTeleoperatorSim:
         self.show_wrist_camera = show_wrist_camera
         self.wrist_camera_display_period = 1.0 / max(wrist_camera_display_rate, 1e-6)
         self.wrist_camera_display_scale = max(wrist_camera_display_scale, 1e-6)
-        self._wrist_camera_window_initialized = False
+        self.default_render_sensor_names = ("d435_top_camera", "wrist_camera")
+        self.show_default_sensor_cameras = True
+        self._camera_window_initialized = {}
         self._last_wrist_camera_display_time = 0.0
         self.cv2 = None
         if self.show_wrist_camera:
             if self.robot_uids != "piper":
                 raise ValueError("--show-wrist-camera is only supported for --robot piper")
+        if self.show_wrist_camera or self.show_default_sensor_cameras:
             try:
                 import cv2
             except ImportError as exc:
                 raise RuntimeError(
-                    "--show-wrist-camera requires OpenCV. Install opencv-python "
+                    "Camera display requires OpenCV. Install opencv-python "
                     "in this environment, then run again."
                 ) from exc
             self.cv2 = cv2
@@ -403,24 +406,9 @@ class ServoTeleoperatorSim:
         """Default angle sending callback (for debugging)"""
         print(f"Servo angles (degrees): {np.degrees(arm_pos)}")
 
-    def _display_wrist_camera(self):
-        """Display the piper wrist camera in a separate OpenCV window."""
-        if not self.show_wrist_camera:
-            return
-
-        now = time.monotonic()
-        if now - self._last_wrist_camera_display_time < self.wrist_camera_display_period:
-            return
-        self._last_wrist_camera_display_time = now
-
-        sensor_images = self.env.unwrapped.get_sensor_images()
-        wrist_images = sensor_images.get("wrist_camera")
-        if not wrist_images:
-            return
-
-        frame = wrist_images.get("rgb")
+    def _sensor_frame_to_bgr(self, frame):
         if frame is None:
-            frame = next(iter(wrist_images.values()))
+            return None
         if hasattr(frame, "detach"):
             frame = frame.detach().cpu().numpy()
         frame = np.asarray(frame)
@@ -430,22 +418,72 @@ class ServoTeleoperatorSim:
             frame = frame[..., :3]
         if frame.dtype != np.uint8:
             frame = np.clip(frame, 0, 255).astype(np.uint8)
+        return self.cv2.cvtColor(frame, self.cv2.COLOR_RGB2BGR)
 
-        frame = self.cv2.cvtColor(frame, self.cv2.COLOR_RGB2BGR)
-        if not self._wrist_camera_window_initialized:
-            self.cv2.namedWindow("wrist_camera", self.cv2.WINDOW_NORMAL)
-            display_width = int(frame.shape[1] * self.wrist_camera_display_scale)
-            display_height = int(frame.shape[0] * self.wrist_camera_display_scale)
-            self.cv2.resizeWindow("wrist_camera", display_width, display_height)
-            self._wrist_camera_window_initialized = True
+    def _collect_sensor_frames(self, sensor_names):
+        sensor_images = self.env.unwrapped.get_sensor_images()
+        frames = []
+        for sensor_name in sensor_names:
+            images = sensor_images.get(sensor_name)
+            if not images:
+                continue
+            frame = images.get("rgb")
+            if frame is None:
+                frame = next(iter(images.values()))
+            frame = self._sensor_frame_to_bgr(frame)
+            if frame is not None:
+                frames.append(frame)
+        return frames
+
+    def _display_camera_frames(self, window_name: str, frames):
+        if self.cv2 is None or not frames:
+            return
+        if len(frames) == 1:
+            frame = frames[0]
+        else:
+            target_height = min(frame.shape[0] for frame in frames)
+            resized_frames = []
+            for frame in frames:
+                scale = target_height / frame.shape[0]
+                target_width = max(1, int(frame.shape[1] * scale))
+                resized_frames.append(
+                    self.cv2.resize(
+                        frame,
+                        (target_width, target_height),
+                        interpolation=self.cv2.INTER_LINEAR,
+                    )
+                )
+            frame = np.concatenate(resized_frames, axis=1)
         if self.wrist_camera_display_scale != 1.0:
             display_size = (
                 int(frame.shape[1] * self.wrist_camera_display_scale),
                 int(frame.shape[0] * self.wrist_camera_display_scale),
             )
             frame = self.cv2.resize(frame, display_size, interpolation=self.cv2.INTER_LINEAR)
-        self.cv2.imshow("wrist_camera", frame)
+        if not self._camera_window_initialized.get(window_name, False):
+            self.cv2.namedWindow(window_name, self.cv2.WINDOW_NORMAL)
+            self.cv2.resizeWindow(window_name, frame.shape[1], frame.shape[0])
+            self._camera_window_initialized[window_name] = True
+        self.cv2.imshow(window_name, frame)
         self.cv2.waitKey(1)
+
+    def _display_default_sensor_cameras(self):
+        """Display the default top-down D435 camera and wrist camera when available."""
+        if not self.show_default_sensor_cameras:
+            return
+        now = time.monotonic()
+        if now - self._last_wrist_camera_display_time < self.wrist_camera_display_period:
+            return
+        self._last_wrist_camera_display_time = now
+        frames = self._collect_sensor_frames(self.default_render_sensor_names)
+        self._display_camera_frames("default_sensor_cameras", frames)
+
+    def _display_wrist_camera(self):
+        """Display the piper wrist camera in a separate OpenCV window."""
+        if not self.show_wrist_camera:
+            return
+        frames = self._collect_sensor_frames(("wrist_camera",))
+        self._display_camera_frames("wrist_camera", frames)
 
     def teleop_sim_handler(self, action: np.ndarray, dwell: float = 0.01):
         """Simulation control handler function
@@ -460,6 +498,7 @@ class ServoTeleoperatorSim:
         # All robot types execute actions
         self.env.step(action)
         self.env.render()
+        self._display_default_sensor_cameras()
         self._display_wrist_camera()
         time.sleep(dwell)
     

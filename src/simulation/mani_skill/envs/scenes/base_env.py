@@ -152,11 +152,29 @@ class SceneManipulationEnv(BaseEnv):
 
     @property
     def _default_sensor_configs(self):
+        d435_top_pose = sapien_utils.look_at(
+            eye=[0.306, -1.48, 1.7],
+            target=[0.326, -1.48, 1.66],
+            up=[1, 0, 0],
+        )
+        d435_top_camera = CameraConfig(
+            "d435_top_camera",
+            d435_top_pose,
+            640,
+            480,
+            np.deg2rad(87),
+            0.01,
+            100,
+            shader_pack="default",
+        )
         if self.robot_uids == "fetch":
-            return []
+            return [d435_top_camera]
 
         pose = sapien_utils.look_at([0.3, 0, 0.6], [-0.1, 0, 0.1])
-        return [CameraConfig("base_camera", pose, 128, 128, np.pi / 2, 0.01, 100)]
+        return [
+            CameraConfig("base_camera", pose, 128, 128, np.pi / 2, 0.01, 100),
+            d435_top_camera,
+        ]
 
     @property
     def _default_human_render_camera_configs(self):
