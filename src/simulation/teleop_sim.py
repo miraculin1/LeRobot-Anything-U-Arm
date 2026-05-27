@@ -21,7 +21,11 @@ class ServoTeleoperatorSim:
     """
     
     def __init__(self, scene: str, robot_uids: str, serial_port: str = '/dev/ttyUSB0',
-                 object_pos=None, object_size: float = 0.04, spawn_object: bool = True):
+                 object_pos=None, object_size: float = 0.04, spawn_object: bool = True,
+                 render_mode: str = "human", wrist_camera_width: int = 320,
+                 wrist_camera_height: int = 320, show_wrist_camera: bool = False,
+                 wrist_camera_display_rate: float = 10.0,
+                 wrist_camera_display_scale: float = 2.0):
         """Initialize teleoperation system
         
         Args:
@@ -31,6 +35,12 @@ class ServoTeleoperatorSim:
             object_pos: Position of the grasp object center [x, y, z]
             object_size: Edge length of the grasp object
             spawn_object: Whether to spawn a grasp object
+            render_mode: ManiSkill render mode
+            wrist_camera_width: Width of the piper wrist camera image
+            wrist_camera_height: Height of the piper wrist camera image
+            show_wrist_camera: Whether to show the piper wrist camera in an OpenCV window
+            wrist_camera_display_rate: Wrist camera display refresh rate in Hz
+            wrist_camera_display_scale: Display scaling factor for the OpenCV window
         """
         # Serial port configuration
         self.SERIAL_PORT = serial_port
@@ -45,6 +55,26 @@ class ServoTeleoperatorSim:
         self.object_size = object_size
         self.spawn_object = spawn_object
         self.grasp_object = None
+        self.render_mode = render_mode
+        self.wrist_camera_width = wrist_camera_width
+        self.wrist_camera_height = wrist_camera_height
+        self.show_wrist_camera = show_wrist_camera
+        self.wrist_camera_display_period = 1.0 / max(wrist_camera_display_rate, 1e-6)
+        self.wrist_camera_display_scale = max(wrist_camera_display_scale, 1e-6)
+        self._wrist_camera_window_initialized = False
+        self._last_wrist_camera_display_time = 0.0
+        self.cv2 = None
+        if self.show_wrist_camera:
+            if self.robot_uids != "piper":
+                raise ValueError("--show-wrist-camera is only supported for --robot piper")
+            try:
+                import cv2
+            except ImportError as exc:
+                raise RuntimeError(
+                    "--show-wrist-camera requires OpenCV. Install opencv-python "
+                    "in this environment, then run again."
+                ) from exc
+            self.cv2 = cv2
         self.zero_angles = [0.0] * 7  # Initial calibration angles for servos
         self.sim_init_angles = [0.0] * 7  # Simulation initial angles
         self.stop_event = Event()
@@ -64,13 +94,20 @@ class ServoTeleoperatorSim:
         else: 
             self.control_mode = "pd_joint_pos"
 
+        sensor_configs = dict(shader_pack="rt-fast")
+        if robot_uids == "piper":
+            sensor_configs["wrist_camera"] = dict(
+                width=self.wrist_camera_width,
+                height=self.wrist_camera_height,
+            )
+
         # Create simulation environment
         self.env = gym.make(
             scene,
             robot_uids=robot_uids,
-            render_mode="human",
+            render_mode=self.render_mode,
             control_mode=self.control_mode,
-            sensor_configs=dict(shader_pack="rt-fast"),
+            sensor_configs=sensor_configs,
             human_render_camera_configs=dict(shader_pack="rt-fast"),
             viewer_camera_configs=dict(shader_pack="rt-fast"),
             sim_config=dict(
@@ -366,6 +403,50 @@ class ServoTeleoperatorSim:
         """Default angle sending callback (for debugging)"""
         print(f"Servo angles (degrees): {np.degrees(arm_pos)}")
 
+    def _display_wrist_camera(self):
+        """Display the piper wrist camera in a separate OpenCV window."""
+        if not self.show_wrist_camera:
+            return
+
+        now = time.monotonic()
+        if now - self._last_wrist_camera_display_time < self.wrist_camera_display_period:
+            return
+        self._last_wrist_camera_display_time = now
+
+        sensor_images = self.env.unwrapped.get_sensor_images()
+        wrist_images = sensor_images.get("wrist_camera")
+        if not wrist_images:
+            return
+
+        frame = wrist_images.get("rgb")
+        if frame is None:
+            frame = next(iter(wrist_images.values()))
+        if hasattr(frame, "detach"):
+            frame = frame.detach().cpu().numpy()
+        frame = np.asarray(frame)
+        if frame.ndim == 4:
+            frame = frame[0]
+        if frame.shape[-1] == 4:
+            frame = frame[..., :3]
+        if frame.dtype != np.uint8:
+            frame = np.clip(frame, 0, 255).astype(np.uint8)
+
+        frame = self.cv2.cvtColor(frame, self.cv2.COLOR_RGB2BGR)
+        if not self._wrist_camera_window_initialized:
+            self.cv2.namedWindow("wrist_camera", self.cv2.WINDOW_NORMAL)
+            display_width = int(frame.shape[1] * self.wrist_camera_display_scale)
+            display_height = int(frame.shape[0] * self.wrist_camera_display_scale)
+            self.cv2.resizeWindow("wrist_camera", display_width, display_height)
+            self._wrist_camera_window_initialized = True
+        if self.wrist_camera_display_scale != 1.0:
+            display_size = (
+                int(frame.shape[1] * self.wrist_camera_display_scale),
+                int(frame.shape[0] * self.wrist_camera_display_scale),
+            )
+            frame = self.cv2.resize(frame, display_size, interpolation=self.cv2.INTER_LINEAR)
+        self.cv2.imshow("wrist_camera", frame)
+        self.cv2.waitKey(1)
+
     def teleop_sim_handler(self, action: np.ndarray, dwell: float = 0.01):
         """Simulation control handler function
         
@@ -379,6 +460,7 @@ class ServoTeleoperatorSim:
         # All robot types execute actions
         self.env.step(action)
         self.env.render()
+        self._display_wrist_camera()
         time.sleep(dwell)
     
     def angle_stream_loop(self, on_send):
@@ -474,6 +556,8 @@ class ServoTeleoperatorSim:
             print("All threads stopped")
             self.env.close()
             self.ser.close()
+            if self.cv2 is not None:
+                self.cv2.destroyAllWindows()
             print("Resource cleanup completed")
 
 
@@ -508,11 +592,47 @@ if __name__ == "__main__":
         help='Serial port device path'
     )
     parser.add_argument(
+        '--render-mode',
+        type=str,
+        default='human',
+        choices=['human', 'rgb_array', 'sensors', 'all'],
+        help='ManiSkill render mode'
+    )
+    parser.add_argument(
+        '--wrist-camera-width',
+        type=int,
+        default=320,
+        help='Piper wrist camera image width'
+    )
+    parser.add_argument(
+        '--wrist-camera-height',
+        type=int,
+        default=320,
+        help='Piper wrist camera image height'
+    )
+    parser.add_argument(
+        '--show-wrist-camera',
+        action='store_true',
+        help='Show the piper wrist camera in a separate OpenCV window'
+    )
+    parser.add_argument(
+        '--wrist-camera-display-rate',
+        type=float,
+        default=10.0,
+        help='Piper wrist camera display refresh rate in Hz'
+    )
+    parser.add_argument(
+        '--wrist-camera-display-scale',
+        type=float,
+        default=2.0,
+        help='Piper wrist camera OpenCV display scale'
+    )
+    parser.add_argument(
         '--object-pos',
         type=float,
         nargs=3,
         metavar=('X', 'Y', 'Z'),
-        default=[0.606, -1.48, 1.66],
+        default=[0.306, -1.48, 1.66],
         help='Grasp object center position in world coordinates'
     )
     parser.add_argument(
@@ -537,6 +657,12 @@ if __name__ == "__main__":
     print(f"Simulation scene:   {args.scene}")
     print(f"Control frequency:   {args.rate} Hz")
     print(f"Serial device:   {args.serial_port}")
+    print(f"Render mode:     {args.render_mode}")
+    if args.robot == "piper":
+        print(f"Wrist camera:    {args.wrist_camera_width}x{args.wrist_camera_height}")
+        print(f"Wrist display:   {'enabled' if args.show_wrist_camera else 'disabled'}")
+        if args.show_wrist_camera:
+            print(f"Wrist scale:     {args.wrist_camera_display_scale}x")
     if args.no_object:
         print("Grasp object:     disabled")
     else:
@@ -553,6 +679,12 @@ if __name__ == "__main__":
             object_pos=args.object_pos,
             object_size=args.object_size,
             spawn_object=not args.no_object,
+            render_mode=args.render_mode,
+            wrist_camera_width=args.wrist_camera_width,
+            wrist_camera_height=args.wrist_camera_height,
+            show_wrist_camera=args.show_wrist_camera,
+            wrist_camera_display_rate=args.wrist_camera_display_rate,
+            wrist_camera_display_scale=args.wrist_camera_display_scale,
         )
         sim.rate = args.rate
         sim.run()

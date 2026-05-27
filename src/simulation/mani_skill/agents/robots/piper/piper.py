@@ -78,6 +78,21 @@ class Piper(BaseAgent):
     gripper_force_limit = 10   # Based on effort limit of gripper joints in URDF
 
     @property
+    def _sensor_configs(self):
+        return [
+            CameraConfig(
+                uid="wrist_camera",
+                pose=sapien.Pose(p=[0, 0, 0], q=[1, 0, 0, 0]),
+                width=128,
+                height=128,
+                fov=np.pi / 2,
+                near=0.01,
+                far=100,
+                mount=self.robot.links_map["camera"],
+            )
+        ]
+
+    @property
     def _controller_configs(self):
         arm_pd_joint_pos = PDJointPosControllerConfig(
             self.arm_joint_names,
