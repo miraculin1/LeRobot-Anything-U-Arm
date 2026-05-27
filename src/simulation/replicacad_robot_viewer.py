@@ -39,9 +39,9 @@ class StaticRobotViewer:
             robot_uids=robot_uids,
             render_mode="human",
             control_mode=self.control_mode,
-            sensor_configs=dict(shader_pack="rt-fast"),
-            human_render_camera_configs=dict(shader_pack="rt-fast"),
-            viewer_camera_configs=dict(shader_pack="rt-fast"),
+            sensor_configs=dict(shader_pack="default"),
+            human_render_camera_configs=dict(shader_pack="default"),
+            viewer_camera_configs=dict(shader_pack="default"),
         )
         
         # Get action space information

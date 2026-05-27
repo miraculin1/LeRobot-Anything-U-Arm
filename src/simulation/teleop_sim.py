@@ -94,7 +94,7 @@ class ServoTeleoperatorSim:
         else: 
             self.control_mode = "pd_joint_pos"
 
-        sensor_configs = dict(shader_pack="rt-fast")
+        sensor_configs = dict(shader_pack="default")
         if robot_uids == "piper":
             sensor_configs["wrist_camera"] = dict(
                 width=self.wrist_camera_width,
@@ -108,8 +108,8 @@ class ServoTeleoperatorSim:
             render_mode=self.render_mode,
             control_mode=self.control_mode,
             sensor_configs=sensor_configs,
-            human_render_camera_configs=dict(shader_pack="rt-fast"),
-            viewer_camera_configs=dict(shader_pack="rt-fast"),
+            human_render_camera_configs=dict(shader_pack="default"),
+            viewer_camera_configs=dict(shader_pack="default"),
             sim_config=dict(
                 default_materials_config=dict(
                     static_friction=10.0,  # Static friction
