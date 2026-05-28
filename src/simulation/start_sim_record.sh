@@ -9,7 +9,7 @@ conda activate uarm
 python src/simulation/teleop_sim.py \
     --robot piper \
     --record \
-    --record-dir ~/lerobot_sim_data \
+    --record-dir ./lerobot_sim_data \
     --repo-id local/teleop_sim \
     --task "put red box to blue plate" \
     --record-cameras d435_top_camera,wrist_camera \
