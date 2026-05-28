@@ -1,3 +1,5 @@
+import copy
+import os
 import serial
 import time 
 import numpy as np
@@ -9,8 +11,44 @@ from queue import Queue, Empty
 import torch
 import sapien
 import argparse
+from mani_skill.render import PREBUILT_SHADER_CONFIGS
 from mani_skill.utils import sapien_utils
 from mani_skill.utils.building import actors
+
+
+SHADER_PACK_ALIASES = {
+    "fast_rt": "rt-fast",
+}
+
+
+def normalize_shader_pack(shader_pack: str) -> str:
+    """Map user-facing shader aliases to ManiSkill shader config keys."""
+    return SHADER_PACK_ALIASES.get(shader_pack, shader_pack)
+
+
+def build_camera_shader_config(
+    shader_pack: str,
+    rt_samples_per_pixel: int,
+    rt_path_depth: int,
+    rt_denoiser: str,
+):
+    normalized_shader_pack = normalize_shader_pack(shader_pack)
+    if normalized_shader_pack not in PREBUILT_SHADER_CONFIGS:
+        valid_shader_packs = sorted(PREBUILT_SHADER_CONFIGS.keys()) + sorted(
+            SHADER_PACK_ALIASES.keys()
+        )
+        raise ValueError(
+            f"Unknown shader pack '{shader_pack}'. Valid options: {valid_shader_packs}"
+        )
+
+    shader_config = copy.deepcopy(PREBUILT_SHADER_CONFIGS[normalized_shader_pack])
+    if shader_config.shader_pack[:2] == "rt":
+        shader_config.shader_pack_config.update(
+            ray_tracing_samples_per_pixel=rt_samples_per_pixel,
+            ray_tracing_path_depth=rt_path_depth,
+            ray_tracing_denoiser=rt_denoiser,
+        )
+    return shader_config
 
 
 class ServoTeleoperatorSim: 
@@ -25,7 +63,12 @@ class ServoTeleoperatorSim:
                  render_mode: str = "human", wrist_camera_width: int = 320,
                  wrist_camera_height: int = 320, show_wrist_camera: bool = False,
                  wrist_camera_display_rate: float = 10.0,
-                 wrist_camera_display_scale: float = 2.0):
+                 wrist_camera_display_scale: float = 2.0,
+                 shader_pack: str = "fast_rt",
+                 rt_samples_per_pixel: int = 2,
+                 rt_path_depth: int = 1,
+                 rt_denoiser: str = "oidn",
+                 render_preflight: bool = True):
         """Initialize teleoperation system
         
         Args:
@@ -41,6 +84,11 @@ class ServoTeleoperatorSim:
             show_wrist_camera: Whether to show the piper wrist camera in an OpenCV window
             wrist_camera_display_rate: Wrist camera display refresh rate in Hz
             wrist_camera_display_scale: Display scaling factor for the OpenCV window
+            shader_pack: ManiSkill shader pack, or fast_rt alias for rt-fast
+            rt_samples_per_pixel: Ray tracing samples per pixel
+            rt_path_depth: Ray tracing path depth
+            rt_denoiser: Ray tracing denoiser backend
+            render_preflight: Whether to render one frame during initialization
         """
         # Serial port configuration
         self.SERIAL_PORT = serial_port
@@ -61,6 +109,12 @@ class ServoTeleoperatorSim:
         self.show_wrist_camera = show_wrist_camera
         self.wrist_camera_display_period = 1.0 / max(wrist_camera_display_rate, 1e-6)
         self.wrist_camera_display_scale = max(wrist_camera_display_scale, 1e-6)
+        self.shader_pack = shader_pack
+        self.normalized_shader_pack = normalize_shader_pack(shader_pack)
+        self.rt_samples_per_pixel = rt_samples_per_pixel
+        self.rt_path_depth = rt_path_depth
+        self.rt_denoiser = rt_denoiser
+        self.render_preflight = render_preflight
         self.default_render_sensor_names = ("d435_top_camera", "wrist_camera")
         self.show_default_sensor_cameras = True
         self._camera_window_initialized = {}
@@ -97,30 +151,41 @@ class ServoTeleoperatorSim:
         else: 
             self.control_mode = "pd_joint_pos"
 
-        sensor_configs = dict(shader_pack="default")
+        camera_shader_config = build_camera_shader_config(
+            shader_pack=self.shader_pack,
+            rt_samples_per_pixel=self.rt_samples_per_pixel,
+            rt_path_depth=self.rt_path_depth,
+            rt_denoiser=self.rt_denoiser,
+        )
+        sensor_configs = dict(shader_config=camera_shader_config)
         if robot_uids == "piper":
             sensor_configs["wrist_camera"] = dict(
                 width=self.wrist_camera_width,
                 height=self.wrist_camera_height,
+                shader_config=camera_shader_config,
             )
 
         # Create simulation environment
-        self.env = gym.make(
-            scene,
-            robot_uids=robot_uids,
-            render_mode=self.render_mode,
-            control_mode=self.control_mode,
-            sensor_configs=sensor_configs,
-            human_render_camera_configs=dict(shader_pack="default"),
-            viewer_camera_configs=dict(shader_pack="default"),
-            sim_config=dict(
-                default_materials_config=dict(
-                    static_friction=10.0,  # Static friction
-                    dynamic_friction=10.0, # Dynamic friction
-                    restitution=0.0       # Restitution coefficient
-                )
-            ),
-        )
+        try:
+            self.env = gym.make(
+                scene,
+                robot_uids=robot_uids,
+                render_mode=self.render_mode,
+                control_mode=self.control_mode,
+                sensor_configs=sensor_configs,
+                human_render_camera_configs=dict(shader_config=camera_shader_config),
+                viewer_camera_configs=dict(shader_config=camera_shader_config),
+                sim_config=dict(
+                    default_materials_config=dict(
+                        static_friction=10.0,  # Static friction
+                        dynamic_friction=10.0, # Dynamic friction
+                        restitution=0.0       # Restitution coefficient
+                    )
+                ),
+            )
+        except Exception:
+            self._print_render_diagnostics()
+            raise
         obs, _ = self.env.reset(seed=0)
         print("Action space:", self.env.action_space)
         if self.spawn_object:
@@ -145,7 +210,30 @@ class ServoTeleoperatorSim:
         )
 
         self._setup_camera_pose()
+        if self.render_preflight:
+            self._run_render_preflight()
 
+
+    def _print_render_diagnostics(self):
+        print("[ERROR] Render initialization failed. Diagnostics:")
+        print(f"DISPLAY={os.environ.get('DISPLAY')}")
+        print(f"XDG_RUNTIME_DIR={os.environ.get('XDG_RUNTIME_DIR')}")
+        for device_path in ("/dev/dri", "/dev/nvidia0", "/dev/nvidiactl"):
+            print(f"{device_path}: {'present' if os.path.exists(device_path) else 'missing'}")
+        try:
+            print("SAPIEN render device summary:")
+            print(sapien.render.get_device_summary())
+        except Exception as exc:
+            print(f"SAPIEN render device summary unavailable: {exc}")
+
+    def _run_render_preflight(self):
+        try:
+            frame = self.env.render()
+        except Exception:
+            self._print_render_diagnostics()
+            raise
+        frame_shape = getattr(frame, "shape", None)
+        print(f"[INFO] Render preflight completed. Frame shape: {frame_shape}")
 
     def _setup_camera_pose(self):
         agent = getattr(self.env.unwrapped, "agent", None)
@@ -638,6 +726,37 @@ if __name__ == "__main__":
         help='ManiSkill render mode'
     )
     parser.add_argument(
+        '--shader-pack',
+        type=str,
+        default='fast_rt',
+        choices=sorted(PREBUILT_SHADER_CONFIGS.keys()) + sorted(SHADER_PACK_ALIASES.keys()),
+        help='Shader pack to use for all cameras; fast_rt is an alias for rt-fast'
+    )
+    parser.add_argument(
+        '--rt-samples-per-pixel',
+        type=int,
+        default=2,
+        help='Ray tracing samples per pixel for rt shader packs'
+    )
+    parser.add_argument(
+        '--rt-path-depth',
+        type=int,
+        default=1,
+        help='Ray tracing path depth for rt shader packs'
+    )
+    parser.add_argument(
+        '--rt-denoiser',
+        type=str,
+        default='oidn',
+        choices=['none', 'oidn', 'optix'],
+        help='Ray tracing denoiser backend'
+    )
+    parser.add_argument(
+        '--no-render-preflight',
+        action='store_true',
+        help='Skip the one-frame render preflight during initialization'
+    )
+    parser.add_argument(
         '--wrist-camera-width',
         type=int,
         default=320,
@@ -697,6 +816,11 @@ if __name__ == "__main__":
     print(f"Control frequency:   {args.rate} Hz")
     print(f"Serial device:   {args.serial_port}")
     print(f"Render mode:     {args.render_mode}")
+    print(f"Shader pack:     {args.shader_pack} ({normalize_shader_pack(args.shader_pack)})")
+    print(f"RT samples:      {args.rt_samples_per_pixel}")
+    print(f"RT path depth:   {args.rt_path_depth}")
+    print(f"RT denoiser:     {args.rt_denoiser}")
+    print(f"Render preflight: {'enabled' if not args.no_render_preflight else 'disabled'}")
     if args.robot == "piper":
         print(f"Wrist camera:    {args.wrist_camera_width}x{args.wrist_camera_height}")
         print(f"Wrist display:   {'enabled' if args.show_wrist_camera else 'disabled'}")
@@ -724,6 +848,11 @@ if __name__ == "__main__":
             show_wrist_camera=args.show_wrist_camera,
             wrist_camera_display_rate=args.wrist_camera_display_rate,
             wrist_camera_display_scale=args.wrist_camera_display_scale,
+            shader_pack=args.shader_pack,
+            rt_samples_per_pixel=args.rt_samples_per_pixel,
+            rt_path_depth=args.rt_path_depth,
+            rt_denoiser=args.rt_denoiser,
+            render_preflight=not args.no_render_preflight,
         )
         sim.rate = args.rate
         sim.run()
