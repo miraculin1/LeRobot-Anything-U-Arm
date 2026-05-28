@@ -1,6 +1,8 @@
 import copy
 import os
+import shutil
 import serial
+import sys
 import time 
 import numpy as np
 import re
@@ -11,6 +13,7 @@ from queue import Queue, Empty
 import torch
 import sapien
 import argparse
+from transforms3d.euler import euler2quat
 from mani_skill.render import PREBUILT_SHADER_CONFIGS
 from mani_skill.utils import sapien_utils
 from mani_skill.utils.building import actors
@@ -68,7 +71,13 @@ class ServoTeleoperatorSim:
                  rt_samples_per_pixel: int = 2,
                  rt_path_depth: int = 1,
                  rt_denoiser: str = "oidn",
-                 render_preflight: bool = True):
+                 render_preflight: bool = True,
+                 record: bool = False,
+                 record_dir: str = "~/lerobot_sim_data",
+                 repo_id: str = "local/teleop_sim",
+                 task: str = "put red box to blue plate",
+                 record_cameras=None,
+                 record_fps: int = 30):
         """Initialize teleoperation system
         
         Args:
@@ -99,7 +108,7 @@ class ServoTeleoperatorSim:
         self.scene = scene
         self.robot_uids = robot_uids
         self.gripper_range = 0.43
-        self.object_pos = object_pos if object_pos is not None else [0.606, -1.48, 0.66]
+        self.object_pos = object_pos if object_pos is not None else [0.457, -1.612, 0.956]
         self.object_size = object_size
         self.spawn_object = spawn_object
         self.grasp_object = None
@@ -136,6 +145,39 @@ class ServoTeleoperatorSim:
         self.sim_init_angles = [0.0] * 7  # Simulation initial angles
         self.stop_event = Event()
         self.rate = 50.0  # Control frequency
+        self.record_enabled = record
+        self.record_dir = os.path.expanduser(record_dir)
+        self.repo_id = repo_id
+        self.task = "put red box to blue plate"
+        if task != self.task:
+            print(f"[WARN] Ignoring --task '{task}'. Fixed task is: {self.task}")
+        self.record_cameras = tuple(record_cameras or ("d435_top_camera", "wrist_camera"))
+        self.record_fps = int(record_fps)
+        self.record_period = 1.0 / max(float(self.record_fps), 1.0)
+        self.dataset = None
+        self.record_state = "disabled" if not self.record_enabled else "initializing"
+        self.record_lock = Lock()
+        self.pending_stop_episode = False
+        self.pending_episode_decision = None
+        self.pending_quit = False
+        self.exit_after_episode_decision = False
+        self.last_record_time = 0.0
+        self.last_recorded_state = None
+        self.current_episode_frames = 0
+        self.countdown_end_time = None
+        self.status_message = "Recording disabled"
+        self._ui_buttons = {}
+        self.plates = []
+        self.plate_specs = [
+            ("blue_plate", [0.05, 0.18, 1.0, 1.0]),
+            ("green_plate", [0.1, 0.7, 0.2, 1.0]),
+            ("yellow_plate", [1.0, 0.85, 0.05, 1.0]),
+        ]
+        self.plate_radius = 0.045
+        self.plate_half_height = 0.004
+        self.plate_quat = euler2quat(0, np.pi / 2, 0)
+        self.random_workspace = dict(x=(0.395, 0.673), y=(-1.959, -0.991))
+        self.min_object_spacing = 0.10
         
         # Initialize servos and calibrate zero position
         self._init_servos()
@@ -190,6 +232,8 @@ class ServoTeleoperatorSim:
         print("Action space:", self.env.action_space)
         if self.spawn_object:
             self._spawn_grasp_object()
+            self._spawn_plates()
+            self._randomize_task_objects()
         
         # Set initial standing pose for H1
         if robot_uids == "unitree_h1":
@@ -212,6 +256,9 @@ class ServoTeleoperatorSim:
         self._setup_camera_pose()
         if self.render_preflight:
             self._run_render_preflight()
+        if self.record_enabled:
+            self._setup_lerobot_dataset()
+            self._begin_recording_episode()
 
 
     def _print_render_diagnostics(self):
@@ -267,6 +314,74 @@ class ServoTeleoperatorSim:
             f"Spawned grasp object 'teleop_cube' at {self.object_pos} "
             f"with size {self.object_size} m"
         )
+
+    def _spawn_plates(self):
+        """Create reusable colored plate actors. Episode resets only move them."""
+        self.plates = []
+        table_z = self.object_pos[2] - self.object_size / 2.0
+        plate_z = table_z + self.plate_half_height
+        for idx, (name, color) in enumerate(self.plate_specs):
+            plate = actors.build_cylinder(
+                self.env.unwrapped.scene,
+                radius=self.plate_radius,
+                half_length=self.plate_half_height,
+                color=color,
+                name=name,
+                body_type="dynamic",
+                initial_pose=sapien.Pose(
+                    p=[self.object_pos[0] + 0.12 * idx, self.object_pos[1], plate_z],
+                    q=self.plate_quat,
+                ),
+            )
+            self.plates.append(plate)
+        print(f"[INFO] Spawned {len(self.plates)} colored plates: blue, green, yellow")
+
+    def _sample_non_overlapping_xy(self, count: int):
+        rng = np.random.default_rng()
+        xs = self.random_workspace["x"]
+        ys = self.random_workspace["y"]
+        points = []
+        for _ in range(count):
+            for _attempt in range(200):
+                point = np.array(
+                    [
+                        rng.uniform(xs[0], xs[1]),
+                        rng.uniform(ys[0], ys[1]),
+                    ],
+                    dtype=np.float64,
+                )
+                if all(np.linalg.norm(point - prev) >= self.min_object_spacing for prev in points):
+                    points.append(point)
+                    break
+            else:
+                points.append(point)
+        return points
+
+    def _randomize_task_objects(self):
+        if not self.spawn_object or self.grasp_object is None:
+            return
+        total_objects = 1 + len(self.plates)
+        points = self._sample_non_overlapping_xy(total_objects)
+        cube_pose = sapien.Pose(
+            p=[points[0][0], points[0][1], self.object_pos[2]]
+        )
+        self.grasp_object.set_pose(cube_pose)
+        table_z = self.object_pos[2] - self.object_size / 2.0
+        plate_z = table_z + self.plate_half_height
+        for plate, point in zip(self.plates, points[1:]):
+            plate.set_pose(sapien.Pose(p=[point[0], point[1], plate_z], q=self.plate_quat))
+            self._zero_actor_velocity(plate)
+        print(
+            "[INFO] Randomized task objects: "
+            f"red box xy={points[0].round(3).tolist()}, "
+            f"blue plate xy={points[1].round(3).tolist() if len(points) > 1 else 'n/a'}"
+        )
+
+    def _zero_actor_velocity(self, actor):
+        for method_name in ("set_linear_velocity", "set_angular_velocity"):
+            method = getattr(actor, method_name, None)
+            if callable(method):
+                method(np.zeros(3, dtype=np.float32))
 
     def _setup_h1_standing_pose(self):
         """Set initial standing pose for H1 robot"""
@@ -494,6 +609,225 @@ class ServoTeleoperatorSim:
         """Default angle sending callback (for debugging)"""
         print(f"Servo angles (degrees): {np.degrees(arm_pos)}")
 
+    def _setup_lerobot_dataset(self):
+        if self.robot_uids != "piper":
+            raise ValueError("--record is currently implemented for --robot piper only")
+        if self.record_fps <= 0:
+            raise ValueError("--record-fps must be positive")
+        try:
+            from lerobot.datasets.lerobot_dataset import LeRobotDataset
+        except ImportError as exc:
+            raise RuntimeError(
+                "Recording requires lerobot in the active Python environment. "
+                "Install the project requirements or run with the uarm conda environment."
+            ) from exc
+
+        dataset_root = os.path.join(self.record_dir, self.repo_id)
+        os.makedirs(os.path.dirname(dataset_root), exist_ok=True)
+        features = {
+            "observation.state": {
+                "dtype": "float32",
+                "shape": (7,),
+                "names": ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6", "gripper"],
+            },
+            "action": {
+                "dtype": "float32",
+                "shape": (7,),
+                "names": ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6", "gripper"],
+            },
+        }
+        camera_shapes = {
+            "d435_top_camera": (480, 640, 3),
+            "wrist_camera": (self.wrist_camera_height, self.wrist_camera_width, 3),
+        }
+        for camera_name in self.record_cameras:
+            if camera_name not in camera_shapes:
+                raise ValueError(
+                    f"Unsupported --record-cameras entry '{camera_name}'. "
+                    "Supported cameras: d435_top_camera,wrist_camera"
+                )
+            features[f"observation.images.{camera_name}"] = {
+                "dtype": "image",
+                "shape": camera_shapes[camera_name],
+                "names": ["height", "width", "channels"],
+            }
+
+        has_dataset_info = os.path.exists(os.path.join(dataset_root, "meta", "info.json"))
+        has_episode_tables = False
+        if has_dataset_info:
+            for root, _dirs, files in os.walk(os.path.join(dataset_root, "data")):
+                if any(name.endswith(".parquet") for name in files):
+                    has_episode_tables = True
+                    break
+            if not has_episode_tables:
+                print(f"[WARN] Recreating empty LeRobot dataset root: {dataset_root}")
+                shutil.rmtree(dataset_root)
+                has_dataset_info = False
+
+        if has_dataset_info:
+            self.dataset = LeRobotDataset(self.repo_id, root=dataset_root)
+            self.dataset.episode_buffer = self.dataset.create_episode_buffer()
+            print(f"[INFO] Loaded existing LeRobot dataset: {dataset_root}")
+        else:
+            if os.path.isdir(dataset_root):
+                if os.listdir(dataset_root):
+                    raise RuntimeError(
+                        f"Record root exists but is not a LeRobot dataset: {dataset_root}. "
+                        "Use a different --repo-id/--record-dir or move the existing directory."
+                    )
+                os.rmdir(dataset_root)
+            self.dataset = LeRobotDataset.create(
+                repo_id=self.repo_id,
+                fps=self.record_fps,
+                features=features,
+                root=dataset_root,
+                robot_type="piper",
+                use_videos=False,
+            )
+            print(f"[INFO] Created LeRobot dataset: {dataset_root}")
+
+    def _begin_recording_episode(self):
+        with self.record_lock:
+            self.record_state = "recording"
+            self.pending_stop_episode = False
+            self.pending_episode_decision = None
+            self.last_record_time = 0.0
+            self.last_recorded_state = None
+            self.current_episode_frames = 0
+            self.countdown_end_time = None
+            episode_index = self._current_dataset_episode_index()
+            self.status_message = f"RECORDING episode {episode_index}"
+        print(
+            f"[RECORD] Recording episode {episode_index}. "
+            "Use terminal 'n' or GUI Stop Episode to finish."
+        )
+
+    def _current_dataset_episode_index(self):
+        if self.dataset is None:
+            return 0
+        return int(getattr(self.dataset.meta, "total_episodes", 0))
+
+    def _request_stop_episode(self):
+        with self.record_lock:
+            if self.record_state == "recording":
+                self.pending_stop_episode = True
+            elif self.record_state == "confirm_save":
+                print("[RECORD] Episode already stopped. Choose save or discard.")
+
+    def _request_episode_decision(self, decision: str):
+        with self.record_lock:
+            if self.record_state != "confirm_save":
+                print("[RECORD] No episode is waiting for save/discard confirmation.")
+                return
+            self.pending_episode_decision = decision
+
+    def _request_quit(self):
+        with self.record_lock:
+            if self.record_enabled and self.record_state == "recording" and self.current_episode_frames > 0:
+                self.pending_stop_episode = True
+                self.exit_after_episode_decision = True
+            elif self.record_enabled and self.record_state == "confirm_save":
+                self.exit_after_episode_decision = True
+                print("[RECORD] Confirm save/discard before quitting.")
+            else:
+                self.pending_quit = True
+
+    def _enter_save_confirmation(self):
+        with self.record_lock:
+            self.record_state = "confirm_save"
+            self.pending_stop_episode = False
+            frames = self.current_episode_frames
+            episode_index = self._current_dataset_episode_index()
+            self.status_message = (
+                f"CONFIRM episode {episode_index}: {frames} frames. "
+                "Save [y] or discard [d]."
+            )
+        print(
+            f"[RECORD] Episode {episode_index} stopped with {frames} frames. "
+            "Save episode? [y]/save or discard with [d]/discard. [q] quits after decision."
+        )
+
+    def _save_current_episode(self):
+        if self.dataset is None or self.current_episode_frames == 0:
+            print("[RECORD] No frames recorded; skipping save.")
+            self._clear_current_episode_buffer()
+            return
+        episode_index = self._current_dataset_episode_index()
+        print(f"[RECORD] Saving episode {episode_index} ({self.current_episode_frames} frames)...")
+        self.dataset.save_episode()
+        print(f"[RECORD] Saved episode {episode_index}.")
+
+    def _clear_current_episode_buffer(self):
+        if self.dataset is None or getattr(self.dataset, "episode_buffer", None) is None:
+            return
+        episode_index = self.dataset.episode_buffer.get("episode_index")
+        if episode_index is not None:
+            for camera_key in getattr(self.dataset.meta, "camera_keys", []):
+                try:
+                    img_dir = self.dataset._get_image_file_path(
+                        episode_index=episode_index,
+                        image_key=camera_key,
+                        frame_index=0,
+                    ).parent
+                except Exception:
+                    continue
+                if img_dir.is_dir():
+                    shutil.rmtree(img_dir)
+        if hasattr(self.dataset, "clear_episode_buffer"):
+            self.dataset.clear_episode_buffer()
+        else:
+            self.dataset.episode_buffer = self.dataset.create_episode_buffer()
+
+    def _discard_current_episode(self):
+        episode_index = self._current_dataset_episode_index()
+        print(f"[RECORD] Discarding episode {episode_index} ({self.current_episode_frames} frames).")
+        self._clear_current_episode_buffer()
+
+    def _start_next_episode_countdown(self):
+        self._randomize_task_objects()
+        with self.record_lock:
+            self.record_state = "countdown"
+            self.countdown_end_time = time.monotonic() + 3.0
+            self.last_recorded_state = None
+            self.current_episode_frames = 0
+            self.status_message = "STARTING IN 3"
+
+    def _process_recording_events(self):
+        if not self.record_enabled:
+            return
+        with self.record_lock:
+            pending_stop = self.pending_stop_episode
+            pending_decision = self.pending_episode_decision
+            pending_quit = self.pending_quit
+            state = self.record_state
+        if pending_quit:
+            self.stop_event.set()
+            return
+        if pending_stop and state == "recording":
+            self._enter_save_confirmation()
+            return
+        if pending_decision and state == "confirm_save":
+            with self.record_lock:
+                self.pending_episode_decision = None
+                self.status_message = "SAVING" if pending_decision == "save" else "DISCARDING"
+            if pending_decision == "save":
+                self._save_current_episode()
+            else:
+                self._discard_current_episode()
+            if self.exit_after_episode_decision:
+                with self.record_lock:
+                    self.pending_quit = True
+                return
+            self._start_next_episode_countdown()
+            return
+        if state == "countdown":
+            now = time.monotonic()
+            remaining = max(0.0, (self.countdown_end_time or now) - now)
+            with self.record_lock:
+                self.status_message = f"STARTING IN {int(np.ceil(remaining))}"
+            if remaining <= 0:
+                self._begin_recording_episode()
+
     def _sensor_frame_to_bgr(self, frame):
         if frame is None:
             return None
@@ -507,6 +841,20 @@ class ServoTeleoperatorSim:
         if frame.dtype != np.uint8:
             frame = np.clip(frame, 0, 255).astype(np.uint8)
         return self.cv2.cvtColor(frame, self.cv2.COLOR_RGB2BGR)
+
+    def _sensor_frame_to_rgb(self, frame):
+        if frame is None:
+            return None
+        if hasattr(frame, "detach"):
+            frame = frame.detach().cpu().numpy()
+        frame = np.asarray(frame)
+        if frame.ndim == 4:
+            frame = frame[0]
+        if frame.shape[-1] == 4:
+            frame = frame[..., :3]
+        if frame.dtype != np.uint8:
+            frame = np.clip(frame, 0, 255).astype(np.uint8)
+        return frame
 
     def _collect_sensor_frames(self, sensor_names):
         sensor_images = self.env.unwrapped.get_sensor_images()
@@ -522,6 +870,71 @@ class ServoTeleoperatorSim:
             if frame is not None:
                 frames.append(frame)
         return frames
+
+    def _collect_record_camera_frames(self):
+        sensor_images = self.env.unwrapped.get_sensor_images()
+        frames = {}
+        for sensor_name in self.record_cameras:
+            images = sensor_images.get(sensor_name)
+            if not images:
+                return None
+            frame = images.get("rgb")
+            if frame is None:
+                frame = next(iter(images.values()))
+            frame = self._sensor_frame_to_rgb(frame)
+            if frame is None:
+                return None
+            frames[f"observation.images.{sensor_name}"] = frame
+        return frames
+
+    def _get_piper_record_state(self):
+        agent = getattr(self.env.unwrapped, "agent", None)
+        if agent is None:
+            return None
+        qpos = agent.robot.get_qpos()
+        if hasattr(qpos, "detach"):
+            qpos = qpos.detach().cpu().numpy()
+        qpos = np.asarray(qpos, dtype=np.float32).reshape(-1)
+        if qpos.size < 6:
+            return None
+        state = np.zeros(7, dtype=np.float32)
+        state[:6] = qpos[:6]
+        if qpos.size >= 8:
+            state[6] = float(np.mean(qpos[6:8]))
+        elif qpos.size >= 7:
+            state[6] = float(qpos[6])
+        return state
+
+    def _record_current_frame(self):
+        if not self.record_enabled:
+            return
+        with self.record_lock:
+            if self.record_state != "recording":
+                return
+        now = time.monotonic()
+        if self.last_record_time and now - self.last_record_time < self.record_period:
+            return
+        state = self._get_piper_record_state()
+        camera_frames = self._collect_record_camera_frames()
+        if state is None or camera_frames is None:
+            return
+        if self.last_recorded_state is None:
+            action = np.zeros(7, dtype=np.float32)
+        else:
+            action = (state - self.last_recorded_state).astype(np.float32)
+        frame = {
+            "observation.state": state.astype(np.float32),
+            "action": action,
+        }
+        frame.update(camera_frames)
+        timestamp = self.current_episode_frames / float(self.record_fps)
+        self.dataset.add_frame(frame, task=self.task, timestamp=timestamp)
+        self.last_recorded_state = state.copy()
+        self.last_record_time = now
+        self.current_episode_frames += 1
+        if self.current_episode_frames == 1 or self.current_episode_frames % self.record_fps == 0:
+            episode_index = self._current_dataset_episode_index()
+            print(f"[RECORD] Episode {episode_index}: {self.current_episode_frames} frames")
 
     def _display_camera_frames(self, window_name: str, frames):
         if self.cv2 is None or not frames:
@@ -548,12 +961,95 @@ class ServoTeleoperatorSim:
                 int(frame.shape[0] * self.wrist_camera_display_scale),
             )
             frame = self.cv2.resize(frame, display_size, interpolation=self.cv2.INTER_LINEAR)
+        if window_name == "default_sensor_cameras":
+            frame = self._draw_recording_overlay(frame, window_name)
         if not self._camera_window_initialized.get(window_name, False):
             self.cv2.namedWindow(window_name, self.cv2.WINDOW_NORMAL)
             self.cv2.resizeWindow(window_name, frame.shape[1], frame.shape[0])
+            if window_name == "default_sensor_cameras":
+                self.cv2.setMouseCallback(window_name, self._on_camera_window_mouse)
             self._camera_window_initialized[window_name] = True
         self.cv2.imshow(window_name, frame)
-        self.cv2.waitKey(1)
+        key = self.cv2.waitKey(1) & 0xFF
+        self._handle_gui_key(key)
+
+    def _draw_recording_overlay(self, frame, window_name: str):
+        if self.cv2 is None:
+            return frame
+        frame = frame.copy()
+        with self.record_lock:
+            state = self.record_state
+            status = self.status_message
+            frames = self.current_episode_frames
+        self.cv2.rectangle(frame, (0, 0), (frame.shape[1], 72), (20, 20, 20), -1)
+        color = (0, 220, 0) if state == "recording" else (0, 220, 255)
+        self.cv2.putText(
+            frame,
+            status,
+            (12, 28),
+            self.cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            color,
+            2,
+            self.cv2.LINE_AA,
+        )
+        self.cv2.putText(
+            frame,
+            f"frames: {frames} | terminal: n stop, y save, d discard, q quit",
+            (12, 56),
+            self.cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (230, 230, 230),
+            1,
+            self.cv2.LINE_AA,
+        )
+        buttons = []
+        if state == "recording":
+            buttons.append(("Stop Episode", "stop", (frame.shape[1] - 190, 16, 176, 40)))
+        elif state == "confirm_save":
+            buttons.append(("Save", "save", (frame.shape[1] - 190, 16, 82, 40)))
+            buttons.append(("Discard", "discard", (frame.shape[1] - 100, 16, 88, 40)))
+        self._ui_buttons[window_name] = []
+        for label, action, (x, y, w, h) in buttons:
+            self.cv2.rectangle(frame, (x, y), (x + w, y + h), (245, 245, 245), -1)
+            self.cv2.rectangle(frame, (x, y), (x + w, y + h), (40, 40, 40), 1)
+            self.cv2.putText(
+                frame,
+                label,
+                (x + 10, y + 26),
+                self.cv2.FONT_HERSHEY_SIMPLEX,
+                0.52,
+                (25, 25, 25),
+                1,
+                self.cv2.LINE_AA,
+            )
+            self._ui_buttons[window_name].append((x, y, w, h, action))
+        return frame
+
+    def _on_camera_window_mouse(self, event, x, y, flags, param):
+        if self.cv2 is None or event != self.cv2.EVENT_LBUTTONDOWN:
+            return
+        for bx, by, bw, bh, action in self._ui_buttons.get("default_sensor_cameras", []):
+            if bx <= x <= bx + bw and by <= y <= by + bh:
+                if action == "stop":
+                    self._request_stop_episode()
+                elif action == "save":
+                    self._request_episode_decision("save")
+                elif action == "discard":
+                    self._request_episode_decision("discard")
+                return
+
+    def _handle_gui_key(self, key: int):
+        if key in (255, -1):
+            return
+        if key in (ord("n"), ord("s")):
+            self._request_stop_episode()
+        elif key in (ord("y"), ord("\r")):
+            self._request_episode_decision("save")
+        elif key in (ord("d"), ord("x")):
+            self._request_episode_decision("discard")
+        elif key == ord("q"):
+            self._request_quit()
 
     def _display_default_sensor_cameras(self):
         """Display the default top-down D435 camera and wrist camera when available."""
@@ -584,10 +1080,13 @@ class ServoTeleoperatorSim:
             return
             
         # All robot types execute actions
+        self._process_recording_events()
         self.env.step(action)
         self.env.render()
         self._display_default_sensor_cameras()
         self._display_wrist_camera()
+        self._record_current_frame()
+        self._process_recording_events()
         time.sleep(dwell)
     
     def angle_stream_loop(self, on_send):
@@ -662,6 +1161,32 @@ class ServoTeleoperatorSim:
                 time.sleep(sleep_dt)
             else:
                 next_time = time.monotonic()
+
+    def command_loop(self):
+        """Read terminal commands for episode control without blocking simulation."""
+        if not self.record_enabled:
+            return
+        print("[RECORD] Terminal commands: n/next stop episode, y/save save, d/discard discard, q/quit quit.")
+        while not self.stop_event.is_set():
+            try:
+                command = sys.stdin.readline()
+            except Exception as exc:
+                print(f"[RECORD] Terminal command input stopped: {exc}")
+                return
+            if command == "":
+                time.sleep(0.1)
+                continue
+            command = command.strip().lower()
+            if command in ("n", "next", "stop", "end"):
+                self._request_stop_episode()
+            elif command in ("y", "yes", "save"):
+                self._request_episode_decision("save")
+            elif command in ("d", "discard", "drop", "no"):
+                self._request_episode_decision("discard")
+            elif command in ("q", "quit", "exit"):
+                self._request_quit()
+            elif command:
+                print("[RECORD] Unknown command. Use n, y, d, or q.")
     
     def run(self):
         """Start teleoperation system"""
@@ -669,18 +1194,30 @@ class ServoTeleoperatorSim:
         self.produce_thread.start()
         print("Starting simulation control thread...")
         self.consume_thread.start()
+        self.command_thread = None
+        if self.record_enabled:
+            self.command_thread = Thread(target=self.command_loop, daemon=True)
+            self.command_thread.start()
         
         try: 
             print("System running, press Ctrl+C to stop...")
-            while True: 
+            while not self.stop_event.is_set():
                 time.sleep(0.5)
         except KeyboardInterrupt:
             print("Received interrupt signal, preparing to stop...")
+            if self.record_enabled:
+                self._request_quit()
         finally:
             self.stop_event.set()
             self.produce_thread.join(timeout=2.0)
             self.consume_thread.join(timeout=2.0)
+            if self.command_thread is not None:
+                self.command_thread.join(timeout=0.2)
             print("All threads stopped")
+            if self.record_enabled and self.dataset is not None:
+                finalize = getattr(self.dataset, "finalize", None)
+                if callable(finalize):
+                    finalize()
             self.env.close()
             self.ser.close()
             if self.cv2 is not None:
@@ -790,7 +1327,7 @@ if __name__ == "__main__":
         type=float,
         nargs=3,
         metavar=('X', 'Y', 'Z'),
-        default=[0.306, -1.48, 1.66],
+        default=[0.457, -1.612, 0.956],
         help='Grasp object center position in world coordinates'
     )
     parser.add_argument(
@@ -803,6 +1340,41 @@ if __name__ == "__main__":
         '--no-object',
         action='store_true',
         help='Disable spawning the grasp object'
+    )
+    parser.add_argument(
+        '--record',
+        action='store_true',
+        help='Record local LeRobot-format episodes from the simulation'
+    )
+    parser.add_argument(
+        '--record-dir',
+        type=str,
+        default='~/lerobot_sim_data',
+        help='Parent directory for local LeRobot datasets'
+    )
+    parser.add_argument(
+        '--repo-id',
+        type=str,
+        default='local/teleop_sim',
+        help='LeRobot dataset repo id; used as a subdirectory under --record-dir'
+    )
+    parser.add_argument(
+        '--task',
+        type=str,
+        default='put red box to blue plate',
+        help='Task string saved with each frame; this script fixes it to put red box to blue plate'
+    )
+    parser.add_argument(
+        '--record-cameras',
+        type=str,
+        default='d435_top_camera,wrist_camera',
+        help='Comma-separated cameras to record'
+    )
+    parser.add_argument(
+        '--record-fps',
+        type=int,
+        default=30,
+        help='Dataset frame rate'
     )
     
     args = parser.parse_args()
@@ -831,6 +1403,16 @@ if __name__ == "__main__":
     else:
         print(f"Grasp object pos: {args.object_pos}")
         print(f"Grasp object size: {args.object_size} m")
+    record_cameras = tuple(
+        camera.strip() for camera in args.record_cameras.split(",") if camera.strip()
+    )
+    print(f"Recording:        {'enabled' if args.record else 'disabled'}")
+    if args.record:
+        print(f"Record dir:       {os.path.expanduser(args.record_dir)}")
+        print(f"Repo id:          {args.repo_id}")
+        print(f"Task:             put red box to blue plate")
+        print(f"Record cameras:   {record_cameras}")
+        print(f"Record FPS:       {args.record_fps}")
     print("-" * 60)
     
     # Create and run simulation instance
@@ -853,6 +1435,12 @@ if __name__ == "__main__":
             rt_path_depth=args.rt_path_depth,
             rt_denoiser=args.rt_denoiser,
             render_preflight=not args.no_render_preflight,
+            record=args.record,
+            record_dir=args.record_dir,
+            repo_id=args.repo_id,
+            task=args.task,
+            record_cameras=record_cameras,
+            record_fps=args.record_fps,
         )
         sim.rate = args.rate
         sim.run()
