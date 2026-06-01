@@ -178,6 +178,8 @@ class ServoTeleoperatorSim:
         self.plate_quat = euler2quat(0, np.pi / 2, 0)
         self.random_workspace = dict(x=(0.395, 0.673), y=(-1.959, -0.991))
         self.min_object_spacing = 0.10
+        self.fixed_red_box_xy = np.array([0.457, -1.612], dtype=np.float64)
+        self.fixed_blue_plate_xy = np.array([0.577, -1.612], dtype=np.float64)
         
         # Initialize servos and calibrate zero position
         self._init_servos()
@@ -336,11 +338,12 @@ class ServoTeleoperatorSim:
             self.plates.append(plate)
         print(f"[INFO] Spawned {len(self.plates)} colored plates: blue, green, yellow")
 
-    def _sample_non_overlapping_xy(self, count: int):
+    def _sample_non_overlapping_xy(self, count: int, existing_points=None):
         rng = np.random.default_rng()
         xs = self.random_workspace["x"]
         ys = self.random_workspace["y"]
-        points = []
+        points = [np.asarray(point, dtype=np.float64) for point in (existing_points or [])]
+        sampled_points = []
         for _ in range(count):
             for _attempt in range(200):
                 point = np.array(
@@ -352,29 +355,36 @@ class ServoTeleoperatorSim:
                 )
                 if all(np.linalg.norm(point - prev) >= self.min_object_spacing for prev in points):
                     points.append(point)
+                    sampled_points.append(point)
                     break
             else:
                 points.append(point)
-        return points
+                sampled_points.append(point)
+        return sampled_points
 
     def _randomize_task_objects(self):
         if not self.spawn_object or self.grasp_object is None:
             return
-        total_objects = 1 + len(self.plates)
-        points = self._sample_non_overlapping_xy(total_objects)
         cube_pose = sapien.Pose(
-            p=[points[0][0], points[0][1], self.object_pos[2]]
+            p=[self.fixed_red_box_xy[0], self.fixed_red_box_xy[1], self.object_pos[2]]
         )
         self.grasp_object.set_pose(cube_pose)
         table_z = self.object_pos[2] - self.object_size / 2.0
         plate_z = table_z + self.plate_half_height
-        for plate, point in zip(self.plates, points[1:]):
+        fixed_points = [self.fixed_red_box_xy, self.fixed_blue_plate_xy]
+        random_points = self._sample_non_overlapping_xy(
+            max(0, len(self.plates) - 1),
+            existing_points=fixed_points,
+        )
+        plate_points = [self.fixed_blue_plate_xy] + random_points
+        for plate, point in zip(self.plates, plate_points):
             plate.set_pose(sapien.Pose(p=[point[0], point[1], plate_z], q=self.plate_quat))
             self._zero_actor_velocity(plate)
         print(
             "[INFO] Randomized task objects: "
-            f"red box xy={points[0].round(3).tolist()}, "
-            f"blue plate xy={points[1].round(3).tolist() if len(points) > 1 else 'n/a'}"
+            f"red box xy={self.fixed_red_box_xy.round(3).tolist()}, "
+            f"blue plate xy={self.fixed_blue_plate_xy.round(3).tolist()}, "
+            f"random plate xys={[point.round(3).tolist() for point in random_points]}"
         )
 
     def _zero_actor_velocity(self, actor):
