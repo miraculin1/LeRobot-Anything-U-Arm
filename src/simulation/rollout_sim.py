@@ -1,6 +1,10 @@
 import argparse
 import os
+import select
+import signal
+import sys
 import time
+from contextlib import contextmanager
 from threading import Event, Lock, Thread
 
 import gymnasium as gym
@@ -8,17 +12,26 @@ import mani_skill.envs  # Must import to register all env/agent
 import numpy as np
 from transforms3d.euler import euler2quat
 
-from teleop_sim import (
-    ServoTeleoperatorSim,
-    build_camera_shader_config,
-    normalize_shader_pack,
-    PREBUILT_SHADER_CONFIGS,
-    SHADER_PACK_ALIASES,
-)
+try:
+    from teleop_sim import (
+        ServoTeleoperatorSim,
+        build_camera_shader_config,
+        normalize_shader_pack,
+        PREBUILT_SHADER_CONFIGS,
+        SHADER_PACK_ALIASES,
+    )
+except ModuleNotFoundError:
+    from .teleop_sim import (
+        ServoTeleoperatorSim,
+        build_camera_shader_config,
+        normalize_shader_pack,
+        PREBUILT_SHADER_CONFIGS,
+        SHADER_PACK_ALIASES,
+    )
 
 
 class ZeroActionRolloutSim(ServoTeleoperatorSim):
-    """Piper simulation rollout with a fixed zero action source."""
+    """Piper simulation rollout without serial or teleoperation threads."""
 
     def __init__(
         self,
@@ -193,6 +206,103 @@ class ZeroActionRolloutSim(ServoTeleoperatorSim):
             return np.zeros(action_shape, dtype=np.float32)
         return np.zeros(8, dtype=np.float32)
 
+    def get_policy_observation(self, prompt: str, image_size: int):
+        try:
+            from openpi_client import image_tools
+        except ImportError as exc:
+            raise RuntimeError(
+                "OpenPI policy mode requires openpi-client. Install it in the uarm "
+                "environment, for example: pip install -e /workspace/openpi/packages/openpi-client"
+            ) from exc
+
+        state = self._get_piper_record_state()
+        if state is None:
+            raise RuntimeError("Failed to read Piper state from simulation")
+
+        sensor_images = self.env.unwrapped.get_sensor_images()
+        base_image = self._extract_policy_image(sensor_images, "d435_top_camera")
+        wrist_image = self._extract_policy_image(sensor_images, "wrist_camera")
+        base_image = image_tools.convert_to_uint8(
+            image_tools.resize_with_pad(base_image, image_size, image_size)
+        )
+        wrist_image = image_tools.convert_to_uint8(
+            image_tools.resize_with_pad(wrist_image, image_size, image_size)
+        )
+
+        return {
+            "observation/state": state.astype(np.float32),
+            "observation/image": base_image,
+            "observation/wrist_image": wrist_image,
+            "prompt": prompt,
+        }
+
+    def _extract_policy_image(self, sensor_images, sensor_name: str) -> np.ndarray:
+        images = sensor_images.get(sensor_name)
+        if not images:
+            raise RuntimeError(f"Missing sensor images for '{sensor_name}'")
+        frame = images.get("rgb")
+        if frame is None:
+            frame = next(iter(images.values()))
+        frame = self._sensor_frame_to_rgb(frame)
+        if frame is None:
+            raise RuntimeError(f"Failed to convert '{sensor_name}' image to RGB")
+        return frame
+
+    def policy_action_to_env_action(self, policy_action, action_mode: str) -> np.ndarray:
+        policy_action = np.asarray(policy_action, dtype=np.float32).reshape(-1)
+        if policy_action.shape != (7,):
+            raise ValueError(
+                f"Expected a 7D Piper policy action, got shape {policy_action.shape}"
+            )
+        if action_mode == "delta":
+            state = self._get_piper_record_state()
+            if state is None:
+                raise RuntimeError("Failed to read Piper state for delta action conversion")
+            target_state = state.astype(np.float32) + policy_action
+        elif action_mode == "absolute":
+            target_state = policy_action
+        else:
+            raise ValueError(f"Unsupported action mode: {action_mode}")
+        return self.piper_state_to_env_action(target_state)
+
+    def piper_state_to_env_action(self, state_7) -> np.ndarray:
+        state_7 = np.asarray(state_7, dtype=np.float32).reshape(-1)
+        if state_7.shape != (7,):
+            raise ValueError(f"Expected a 7D Piper state/action, got shape {state_7.shape}")
+        env_action = np.zeros(8, dtype=np.float32)
+        env_action[:6] = state_7[:6]
+        env_action[6:] = state_7[6]
+        return env_action
+
+    def validate_action_chunk(self, response) -> np.ndarray:
+        if not isinstance(response, dict) or "actions" not in response:
+            raise RuntimeError("Policy server response must be a dict containing 'actions'")
+        actions = np.asarray(response["actions"], dtype=np.float32)
+        if actions.ndim != 2 or actions.shape[1] != 7:
+            raise RuntimeError(
+                f"Expected policy server actions with shape (N, 7), got {actions.shape}"
+            )
+        if actions.shape[0] == 0:
+            raise RuntimeError("Policy server returned an empty action chunk")
+        return actions
+
+    def idle_step(self):
+        """Advance physics and refresh render/camera windows before policy inference starts."""
+        self.env.step(self.zero_env_action())
+        self.env.render()
+        self._display_default_sensor_cameras()
+        self._display_wrist_camera()
+
+    def close_resources(self):
+        if self.record_enabled and self.dataset is not None:
+            finalize = getattr(self.dataset, "finalize", None)
+            if callable(finalize):
+                finalize()
+        if getattr(self, "env", None) is not None:
+            self.env.close()
+        if self.cv2 is not None:
+            self.cv2.destroyAllWindows()
+
     def _record_current_frame(self):
         if not self.record_enabled:
             return
@@ -220,21 +330,61 @@ class ZeroActionRolloutSim(ServoTeleoperatorSim):
             episode_index = self._current_dataset_episode_index()
             print(f"[RECORD] Episode {episode_index}: {self.current_episode_frames} frames")
 
-    def run(self, max_steps=None, save_on_exit: bool = True):
-        print("Starting zero-action rollout...")
+    def run(
+        self,
+        max_steps=None,
+        save_on_exit: bool = True,
+        policy_mode: str = "zero",
+        policy_client=None,
+        prompt: str = "put red box to blue plate",
+        open_loop_horizon: int = 10,
+        image_size: int = 224,
+        action_mode: str = "delta",
+    ):
+        print(f"Starting {policy_mode} rollout...")
         print("Policy action shape: 7")
         print(f"Control frequency: {self.rate} Hz")
+        if policy_mode == "openpi":
+            if policy_client is None:
+                raise ValueError("policy_client is required when --policy-mode openpi")
+            if open_loop_horizon <= 0:
+                raise ValueError("--open-loop-horizon must be positive")
+            if image_size <= 0:
+                raise ValueError("--image-size must be positive")
+
         command_thread = None
         if self.record_enabled:
             command_thread = Thread(target=self.command_loop, daemon=True)
             command_thread.start()
 
         step_count = 0
+        actions_from_chunk_completed = 0
+        pred_action_chunk = None
         period = max(1.0 / self.rate, 1e-6)
         next_time = time.monotonic()
         try:
             while not self.stop_event.is_set():
-                self.teleop_sim_handler(self.zero_env_action(), dwell=0.0)
+                if policy_mode == "zero":
+                    env_action = self.zero_env_action()
+                elif policy_mode == "openpi":
+                    if (
+                        pred_action_chunk is None
+                        or actions_from_chunk_completed >= min(
+                            open_loop_horizon, pred_action_chunk.shape[0]
+                        )
+                    ):
+                        actions_from_chunk_completed = 0
+                        obs = self.get_policy_observation(prompt, image_size)
+                        with prevent_keyboard_interrupt():
+                            response = policy_client.infer(obs)
+                        pred_action_chunk = self.validate_action_chunk(response)
+                    policy_action = pred_action_chunk[actions_from_chunk_completed]
+                    actions_from_chunk_completed += 1
+                    env_action = self.policy_action_to_env_action(policy_action, action_mode)
+                else:
+                    raise ValueError(f"Unsupported policy mode: {policy_mode}")
+
+                self.teleop_sim_handler(env_action, dwell=0.0)
                 step_count += 1
                 if max_steps is not None and step_count >= max_steps:
                     break
@@ -257,19 +407,32 @@ class ZeroActionRolloutSim(ServoTeleoperatorSim):
                 and self.current_episode_frames > 0
             ):
                 self._save_current_episode()
-            if self.record_enabled and self.dataset is not None:
-                finalize = getattr(self.dataset, "finalize", None)
-                if callable(finalize):
-                    finalize()
-            self.env.close()
-            if self.cv2 is not None:
-                self.cv2.destroyAllWindows()
-            print(f"Zero-action rollout stopped after {step_count} steps")
+            self.close_resources()
+            print(f"{policy_mode} rollout stopped after {step_count} steps")
+
+
+@contextmanager
+def prevent_keyboard_interrupt():
+    interrupted = False
+    original_handler = signal.getsignal(signal.SIGINT)
+
+    def handler(signum, frame):
+        del signum, frame
+        nonlocal interrupted
+        interrupted = True
+
+    signal.signal(signal.SIGINT, handler)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGINT, original_handler)
+        if interrupted:
+            raise KeyboardInterrupt
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Piper zero-action simulation rollout",
+        description="Piper simulation rollout with zero or OpenPI policy actions",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--robot", "-r", default="piper", choices=["piper"])
@@ -280,6 +443,45 @@ def parse_args():
         type=int,
         default=None,
         help="Maximum rollout steps; omit to run until interrupted",
+    )
+    parser.add_argument(
+        "--policy-mode",
+        choices=["zero", "openpi"],
+        default="openpi",
+        help="Action source for the rollout",
+    )
+    parser.add_argument("--host", type=str, default="localhost", help="OpenPI policy server host")
+    parser.add_argument("--port", type=int, default=8000, help="OpenPI policy server port")
+    parser.add_argument("--api-key", type=str, default=None, help="OpenPI policy server API key")
+    parser.add_argument(
+        "--prompt",
+        type=str,
+        default="put red box to blue plate",
+        help="Language instruction sent to OpenPI policy server",
+    )
+    parser.add_argument(
+        "--open-loop-horizon",
+        type=int,
+        default=10,
+        help="Number of actions to execute from each policy chunk before querying again",
+    )
+    parser.add_argument(
+        "--image-size",
+        type=int,
+        default=224,
+        help="Square image size sent to OpenPI policy server",
+    )
+    parser.add_argument(
+        "--action-mode",
+        choices=["delta", "absolute"],
+        default="delta",
+        help="Interpret OpenPI 7D actions as delta from current state or absolute target state",
+    )
+    parser.add_argument(
+        "--wait-for-start",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Wait for terminal confirmation after simulation starts before OpenPI inference",
     )
     parser.add_argument(
         "--render-mode",
@@ -322,6 +524,38 @@ def parse_args():
     return parser.parse_args()
 
 
+def wait_for_human_start(sim: ZeroActionRolloutSim, enabled: bool, policy_mode: str):
+    if not enabled or policy_mode != "openpi":
+        return True
+    if not sys.stdin.isatty():
+        print("[INFO] Non-interactive stdin detected; skipping human start confirmation.")
+        return True
+
+    print("[READY] Simulation environment is running.")
+    print("[READY] Press Enter to connect OpenPI and start inference. Press Ctrl+C to quit.")
+    period = max(1.0 / sim.rate, 1e-6)
+    next_time = time.monotonic()
+    try:
+        while not sim.stop_event.is_set():
+            sim.idle_step()
+            if sim.pending_quit:
+                sim.stop_event.set()
+                return False
+            if sys.stdin in select.select([sys.stdin], [], [], 0.0)[0]:
+                sys.stdin.readline()
+                return True
+            next_time += period
+            sleep_dt = next_time - time.monotonic()
+            if sleep_dt > 0:
+                time.sleep(sleep_dt)
+            else:
+                next_time = time.monotonic()
+    except KeyboardInterrupt:
+        print("Received interrupt signal before inference start.")
+        return False
+    return False
+
+
 def main():
     args = parse_args()
     record_cameras = tuple(
@@ -329,11 +563,18 @@ def main():
     )
 
     print("=" * 60)
-    print("    Piper Zero-Action Simulation Rollout")
+    print("    Piper Simulation Rollout")
     print("=" * 60)
     print(f"Robot arm type: {args.robot}")
     print(f"Simulation scene: {args.scene}")
     print(f"Control frequency: {args.rate} Hz")
+    print(f"Policy mode: {args.policy_mode}")
+    if args.policy_mode == "openpi":
+        print(f"OpenPI server: {args.host}:{args.port}")
+        print(f"Open-loop horizon: {args.open_loop_horizon}")
+        print(f"Policy image size: {args.image_size}")
+        print(f"Action mode: {args.action_mode}")
+        print(f"Prompt: {args.prompt}")
     print(f"Render mode: {args.render_mode}")
     print(f"Shader pack: {args.shader_pack} ({normalize_shader_pack(args.shader_pack)})")
     print(f"RT samples: {args.rt_samples_per_pixel}")
@@ -384,7 +625,37 @@ def main():
         rate=args.rate,
         display_cameras=not args.no_display_cameras,
     )
-    sim.run(max_steps=args.max_steps, save_on_exit=args.save_on_exit)
+
+    if not wait_for_human_start(sim, args.wait_for_start, args.policy_mode):
+        sim.close_resources()
+        return
+
+    policy_client = None
+    if args.policy_mode == "openpi":
+        try:
+            from openpi_client import websocket_client_policy
+        except ImportError as exc:
+            raise RuntimeError(
+                "OpenPI policy mode requires openpi-client. Install it in the uarm "
+                "environment, for example: pip install -e /workspace/openpi/packages/openpi-client"
+            ) from exc
+        policy_client = websocket_client_policy.WebsocketClientPolicy(
+            host=args.host,
+            port=args.port,
+            api_key=args.api_key,
+        )
+        print(f"OpenPI server metadata: {policy_client.get_server_metadata()}")
+
+    sim.run(
+        max_steps=args.max_steps,
+        save_on_exit=args.save_on_exit,
+        policy_mode=args.policy_mode,
+        policy_client=policy_client,
+        prompt=args.prompt,
+        open_loop_horizon=args.open_loop_horizon,
+        image_size=args.image_size,
+        action_mode=args.action_mode,
+    )
 
 
 if __name__ == "__main__":

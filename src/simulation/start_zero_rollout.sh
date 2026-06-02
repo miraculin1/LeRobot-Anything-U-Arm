@@ -8,6 +8,7 @@ conda activate uarm
 
 python src/simulation/rollout_sim.py \
     --robot piper \
+    --policy-mode zero \
     --task "put red box to blue plate" \
     --record-cameras d435_top_camera,wrist_camera \
     --record-fps 30
