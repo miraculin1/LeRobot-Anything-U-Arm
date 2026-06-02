@@ -144,7 +144,10 @@ class ServoTeleoperatorSim:
                  task: str = "put red box to blue plate",
                  record_cameras=None,
                  record_fps: int = 30,
+                 image_writer_processes: int = 0,
+                 image_writer_threads: int = 4,
                  env_render: bool = True,
+                 control_dwell: float = 0.0,
                  debug_timing: bool = False,
                  debug_interval: int = 30,
                  debug_warmup: int = 5):
@@ -195,6 +198,7 @@ class ServoTeleoperatorSim:
         self.rt_denoiser = rt_denoiser
         self.render_preflight = render_preflight
         self.env_render = env_render
+        self.control_dwell = max(0.0, float(control_dwell))
         self.default_render_sensor_names = ("d435_top_camera", "wrist_camera")
         self.show_default_sensor_cameras = True
         self._camera_window_initialized = {}
@@ -231,6 +235,8 @@ class ServoTeleoperatorSim:
         self.record_cameras = tuple(record_cameras or ("d435_top_camera", "wrist_camera"))
         self.record_fps = int(record_fps)
         self.record_period = 1.0 / max(float(self.record_fps), 1.0)
+        self.image_writer_processes = max(0, int(image_writer_processes))
+        self.image_writer_threads = max(0, int(image_writer_threads))
         self.dataset = None
         self.record_state = "disabled" if not self.record_enabled else "initializing"
         self.record_lock = Lock()
@@ -754,6 +760,11 @@ class ServoTeleoperatorSim:
         if has_dataset_info:
             self.dataset = LeRobotDataset(self.repo_id, root=dataset_root)
             self.dataset.episode_buffer = self.dataset.create_episode_buffer()
+            if self.image_writer_processes or self.image_writer_threads:
+                self.dataset.start_image_writer(
+                    num_processes=self.image_writer_processes,
+                    num_threads=self.image_writer_threads,
+                )
             print(f"[INFO] Loaded existing LeRobot dataset: {dataset_root}")
         else:
             if os.path.isdir(dataset_root):
@@ -770,8 +781,15 @@ class ServoTeleoperatorSim:
                 root=dataset_root,
                 robot_type="piper",
                 use_videos=False,
+                image_writer_processes=self.image_writer_processes,
+                image_writer_threads=self.image_writer_threads,
             )
             print(f"[INFO] Created LeRobot dataset: {dataset_root}")
+        if self.image_writer_processes or self.image_writer_threads:
+            print(
+                "[INFO] LeRobot async image writer enabled: "
+                f"processes={self.image_writer_processes}, threads={self.image_writer_threads}"
+            )
 
     def _begin_recording_episode(self):
         with self.record_lock:
@@ -847,6 +865,9 @@ class ServoTeleoperatorSim:
     def _clear_current_episode_buffer(self):
         if self.dataset is None or getattr(self.dataset, "episode_buffer", None) is None:
             return
+        wait_image_writer = getattr(self.dataset, "_wait_image_writer", None)
+        if callable(wait_image_writer):
+            wait_image_writer()
         episode_index = self.dataset.episode_buffer.get("episode_index")
         if episode_index is not None:
             for camera_key in getattr(self.dataset.meta, "camera_keys", []):
@@ -1001,8 +1022,10 @@ class ServoTeleoperatorSim:
         now = time.monotonic()
         if self.last_record_time and now - self.last_record_time < self.record_period:
             return
-        state = self._get_piper_record_state()
-        camera_frames = self._collect_record_camera_frames()
+        with NullTimer(self.timing, "record.state"):
+            state = self._get_piper_record_state()
+        with NullTimer(self.timing, "record.cameras"):
+            camera_frames = self._collect_record_camera_frames()
         if state is None or camera_frames is None:
             return
         if self.last_recorded_state is None:
@@ -1015,7 +1038,8 @@ class ServoTeleoperatorSim:
         }
         frame.update(camera_frames)
         timestamp = self.current_episode_frames / float(self.record_fps)
-        self.dataset.add_frame(frame, task=self.task, timestamp=timestamp)
+        with NullTimer(self.timing, "record.add_frame"):
+            self.dataset.add_frame(frame, task=self.task, timestamp=timestamp)
         self.last_recorded_state = state.copy()
         self.last_record_time = now
         self.current_episode_frames += 1
@@ -1156,12 +1180,11 @@ class ServoTeleoperatorSim:
         frames = self._collect_sensor_frames(("wrist_camera",))
         self._display_camera_frames("wrist_camera", frames)
 
-    def teleop_sim_handler(self, action: np.ndarray, dwell: float = 0.01):
+    def teleop_sim_handler(self, action: np.ndarray):
         """Simulation control handler function
         
         Args:
             action: Robot arm action vector
-            dwell: Delay time
         """
         if self.env is None or action is None:
             return
@@ -1180,9 +1203,9 @@ class ServoTeleoperatorSim:
         with NullTimer(self.timing, "sim.record_frame"):
             self._record_current_frame()
         self._process_recording_events()
-        if dwell > 0:
+        if self.control_dwell > 0:
             sleep_start = time.perf_counter()
-            time.sleep(dwell)
+            time.sleep(self.control_dwell)
             self.timing.record("loop.sleep", time.perf_counter() - sleep_start)
         self.timing.record("loop.total", time.perf_counter() - loop_start)
         self.timing.end_step("teleop")
@@ -1316,6 +1339,9 @@ class ServoTeleoperatorSim:
                 finalize = getattr(self.dataset, "finalize", None)
                 if callable(finalize):
                     finalize()
+                stop_image_writer = getattr(self.dataset, "stop_image_writer", None)
+                if callable(stop_image_writer):
+                    stop_image_writer()
             self.env.close()
             self.ser.close()
             if self.cv2 is not None:
@@ -1365,6 +1391,12 @@ if __name__ == "__main__":
         action=argparse.BooleanOptionalAction,
         default=True,
         help='Call env.render() each step; disable to show only OpenCV camera windows'
+    )
+    parser.add_argument(
+        '--control-dwell',
+        type=float,
+        default=0.0,
+        help='Extra sleep inside each simulation control step; 0 uses only the outer rate limiter'
     )
     parser.add_argument(
         '--shader-pack',
@@ -1481,6 +1513,18 @@ if __name__ == "__main__":
         help='Dataset frame rate'
     )
     parser.add_argument(
+        '--image-writer-processes',
+        type=int,
+        default=0,
+        help='Async LeRobot image writer process count; 0 disables processes'
+    )
+    parser.add_argument(
+        '--image-writer-threads',
+        type=int,
+        default=4,
+        help='Async LeRobot image writer thread count; 0 disables threads'
+    )
+    parser.add_argument(
         '--debug-timing',
         action='store_true',
         help='Print teleoperation/recording timing diagnostics'
@@ -1515,6 +1559,7 @@ if __name__ == "__main__":
     print(f"Serial device:   {args.serial_port}")
     print(f"Render mode:     {args.render_mode}")
     print(f"Env render:      {'enabled' if args.env_render else 'disabled'}")
+    print(f"Control dwell:   {args.control_dwell} s")
     print(f"Shader pack:     {args.shader_pack} ({normalize_shader_pack(args.shader_pack)})")
     print(f"RT samples:      {args.rt_samples_per_pixel}")
     print(f"RT path depth:   {args.rt_path_depth}")
@@ -1541,6 +1586,7 @@ if __name__ == "__main__":
         print(f"Task:             put red box to blue plate")
         print(f"Record cameras:   {record_cameras}")
         print(f"Record FPS:       {args.record_fps}")
+        print(f"Image writer:     {args.image_writer_processes} processes, {args.image_writer_threads} threads")
     print("-" * 60)
     
     # Create and run simulation instance
@@ -1569,7 +1615,10 @@ if __name__ == "__main__":
             task=args.task,
             record_cameras=record_cameras,
             record_fps=args.record_fps,
+            image_writer_processes=args.image_writer_processes,
+            image_writer_threads=args.image_writer_threads,
             env_render=args.env_render,
+            control_dwell=args.control_dwell,
             debug_timing=args.debug_timing,
             debug_interval=args.debug_interval,
             debug_warmup=args.debug_warmup,

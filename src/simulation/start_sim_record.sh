@@ -10,6 +10,7 @@ python src/simulation/teleop_sim.py \
     --robot piper \
     --render-mode sensors \
     --no-env-render \
+    --control-dwell 0.0 \
     --no-render-preflight \
     --debug-timing \
     --record \
@@ -17,4 +18,6 @@ python src/simulation/teleop_sim.py \
     --repo-id local/teleop_sim \
     --task "put red box to blue plate" \
     --record-cameras d435_top_camera,wrist_camera \
-    --record-fps 30
+    --record-fps 30 \
+    --image-writer-processes 0 \
+    --image-writer-threads 8
