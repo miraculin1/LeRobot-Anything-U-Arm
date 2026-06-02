@@ -8,6 +8,10 @@ conda activate uarm
 
 python src/simulation/teleop_sim.py \
     --robot piper \
+    --render-mode sensors \
+    --no-env-render \
+    --no-render-preflight \
+    --debug-timing \
     --record \
     --record-dir ./lerobot_data/eazy_sim_data \
     --repo-id local/teleop_sim \

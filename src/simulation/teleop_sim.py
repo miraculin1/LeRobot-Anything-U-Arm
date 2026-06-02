@@ -24,6 +24,72 @@ SHADER_PACK_ALIASES = {
 }
 
 
+class TimingStats:
+    def __init__(self, enabled: bool, interval: int, warmup: int, target_period: float):
+        self.enabled = enabled
+        self.interval = max(1, int(interval))
+        self.warmup = max(0, int(warmup))
+        self.target_period = target_period
+        self.step = 0
+        self.data = {}
+
+    def record(self, key: str, seconds: float):
+        if not self.enabled or self.step < self.warmup:
+            return
+        values = self.data.setdefault(key, [])
+        values.append(float(seconds) * 1000.0)
+
+    def end_step(self, label: str):
+        if not self.enabled:
+            return
+        self.step += 1
+        if self.step <= self.warmup:
+            return
+        measured_steps = self.step - self.warmup
+        if measured_steps % self.interval != 0:
+            return
+        self.print_summary(label, measured_steps)
+        self.data.clear()
+
+    def print_summary(self, label: str, measured_steps: int):
+        loop_values = self.data.get("loop.total", [])
+        avg_loop_ms = float(np.mean(loop_values)) if loop_values else 0.0
+        fps = 1000.0 / avg_loop_ms if avg_loop_ms > 0 else 0.0
+        target_ms = self.target_period * 1000.0
+        status = "OVERRUN" if avg_loop_ms > target_ms else "OK"
+        print(
+            f"[TIMING] {label} steps={measured_steps} "
+            f"avg_loop={avg_loop_ms:.1f}ms fps={fps:.1f} "
+            f"target={target_ms:.1f}ms {status}"
+        )
+        for key in sorted(self.data):
+            values = self.data[key]
+            if not values:
+                continue
+            print(
+                f"[TIMING]   {key}: "
+                f"avg={np.mean(values):.1f}ms max={np.max(values):.1f}ms "
+                f"last={values[-1]:.1f}ms n={len(values)}"
+            )
+
+
+class NullTimer:
+    def __init__(self, stats: TimingStats, key: str):
+        self.stats = stats
+        self.key = key
+        self.start = None
+
+    def __enter__(self):
+        if self.stats.enabled:
+            self.start = time.perf_counter()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self.start is not None:
+            self.stats.record(self.key, time.perf_counter() - self.start)
+        return False
+
+
 def normalize_shader_pack(shader_pack: str) -> str:
     """Map user-facing shader aliases to ManiSkill shader config keys."""
     return SHADER_PACK_ALIASES.get(shader_pack, shader_pack)
@@ -77,7 +143,11 @@ class ServoTeleoperatorSim:
                  repo_id: str = "local/teleop_sim",
                  task: str = "put red box to blue plate",
                  record_cameras=None,
-                 record_fps: int = 30):
+                 record_fps: int = 30,
+                 env_render: bool = True,
+                 debug_timing: bool = False,
+                 debug_interval: int = 30,
+                 debug_warmup: int = 5):
         """Initialize teleoperation system
         
         Args:
@@ -124,6 +194,7 @@ class ServoTeleoperatorSim:
         self.rt_path_depth = rt_path_depth
         self.rt_denoiser = rt_denoiser
         self.render_preflight = render_preflight
+        self.env_render = env_render
         self.default_render_sensor_names = ("d435_top_camera", "wrist_camera")
         self.show_default_sensor_cameras = True
         self._camera_window_initialized = {}
@@ -145,6 +216,12 @@ class ServoTeleoperatorSim:
         self.sim_init_angles = [0.0] * 7  # Simulation initial angles
         self.stop_event = Event()
         self.rate = 50.0  # Control frequency
+        self.timing = TimingStats(
+            enabled=debug_timing,
+            interval=debug_interval,
+            warmup=debug_warmup,
+            target_period=max(1.0 / self.rate, 1e-6),
+        )
         self.record_enabled = record
         self.record_dir = os.path.expanduser(record_dir)
         self.repo_id = repo_id
@@ -1090,14 +1167,25 @@ class ServoTeleoperatorSim:
             return
             
         # All robot types execute actions
+        loop_start = time.perf_counter()
         self._process_recording_events()
-        self.env.step(action)
-        self.env.render()
-        self._display_default_sensor_cameras()
-        self._display_wrist_camera()
-        self._record_current_frame()
+        with NullTimer(self.timing, "sim.env_step"):
+            self.env.step(action)
+        if self.env_render:
+            with NullTimer(self.timing, "sim.env_render"):
+                self.env.render()
+        with NullTimer(self.timing, "sim.display_cameras"):
+            self._display_default_sensor_cameras()
+            self._display_wrist_camera()
+        with NullTimer(self.timing, "sim.record_frame"):
+            self._record_current_frame()
         self._process_recording_events()
-        time.sleep(dwell)
+        if dwell > 0:
+            sleep_start = time.perf_counter()
+            time.sleep(dwell)
+            self.timing.record("loop.sleep", time.perf_counter() - sleep_start)
+        self.timing.record("loop.total", time.perf_counter() - loop_start)
+        self.timing.end_step("teleop")
     
     def angle_stream_loop(self, on_send):
         """Angle data producer thread: periodically read servo angles
@@ -1268,9 +1356,15 @@ if __name__ == "__main__":
     parser.add_argument(
         '--render-mode',
         type=str,
-        default='human',
+        default='sensors',
         choices=['human', 'rgb_array', 'sensors', 'all'],
         help='ManiSkill render mode'
+    )
+    parser.add_argument(
+        '--env-render',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help='Call env.render() each step; disable to show only OpenCV camera windows'
     )
     parser.add_argument(
         '--shader-pack',
@@ -1386,8 +1480,30 @@ if __name__ == "__main__":
         default=30,
         help='Dataset frame rate'
     )
+    parser.add_argument(
+        '--debug-timing',
+        action='store_true',
+        help='Print teleoperation/recording timing diagnostics'
+    )
+    parser.add_argument(
+        '--debug-interval',
+        type=int,
+        default=30,
+        help='Print timing summary every N measured steps'
+    )
+    parser.add_argument(
+        '--debug-warmup',
+        type=int,
+        default=5,
+        help='Skip the first N steps when collecting timing diagnostics'
+    )
     
     args = parser.parse_args()
+    if not args.env_render and args.render_mode == "human":
+        print(
+            "[WARN] --no-env-render skips per-step env.render(), but --render-mode human "
+            "may still create a SAPIEN viewer. Use --render-mode sensors to hide it."
+        )
     
     # Display startup information
     print("=" * 60)
@@ -1398,11 +1514,13 @@ if __name__ == "__main__":
     print(f"Control frequency:   {args.rate} Hz")
     print(f"Serial device:   {args.serial_port}")
     print(f"Render mode:     {args.render_mode}")
+    print(f"Env render:      {'enabled' if args.env_render else 'disabled'}")
     print(f"Shader pack:     {args.shader_pack} ({normalize_shader_pack(args.shader_pack)})")
     print(f"RT samples:      {args.rt_samples_per_pixel}")
     print(f"RT path depth:   {args.rt_path_depth}")
     print(f"RT denoiser:     {args.rt_denoiser}")
     print(f"Render preflight: {'enabled' if not args.no_render_preflight else 'disabled'}")
+    print(f"Debug timing:    {'enabled' if args.debug_timing else 'disabled'}")
     if args.robot == "piper":
         print(f"Wrist camera:    {args.wrist_camera_width}x{args.wrist_camera_height}")
         print(f"Wrist display:   {'enabled' if args.show_wrist_camera else 'disabled'}")
@@ -1451,8 +1569,13 @@ if __name__ == "__main__":
             task=args.task,
             record_cameras=record_cameras,
             record_fps=args.record_fps,
+            env_render=args.env_render,
+            debug_timing=args.debug_timing,
+            debug_interval=args.debug_interval,
+            debug_warmup=args.debug_warmup,
         )
         sim.rate = args.rate
+        sim.timing.target_period = max(1.0 / sim.rate, 1e-6)
         sim.run()
     except Exception as e:
         print(f"Program runtime error: {e}")
