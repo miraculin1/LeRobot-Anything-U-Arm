@@ -30,6 +30,20 @@ except ModuleNotFoundError:
     )
 
 
+DEFAULT_INITIAL_STATE = np.array(
+    [
+        0.010968562901414746,
+        0.0006513808895519403,
+        -0.002636399535867838,
+        -0.018102952698976972,
+        0.022893221634536675,
+        0.06279406425217975,
+        0.03781127277761698,
+    ],
+    dtype=np.float32,
+)
+
+
 class ZeroActionRolloutSim(ServoTeleoperatorSim):
     """Piper simulation rollout without serial or teleoperation threads."""
 
@@ -59,6 +73,7 @@ class ZeroActionRolloutSim(ServoTeleoperatorSim):
         record_fps: int = 30,
         rate: float = 30.0,
         display_cameras: bool = True,
+        initial_state=None,
     ):
         self.SERIAL_PORT = None
         self.BAUDRATE = None
@@ -140,6 +155,8 @@ class ZeroActionRolloutSim(ServoTeleoperatorSim):
         self.min_object_spacing = 0.10
         self.fixed_red_box_xy = np.array([0.457, -1.612], dtype=np.float64)
         self.fixed_blue_plate_xy = np.array([0.577, -1.612], dtype=np.float64)
+        self.initial_state = self._validate_initial_state(initial_state)
+        self.initial_env_action = self.piper_state_to_env_action(self.initial_state)
 
         if robot_uids == "x_fetch":
             self.control_mode = "pd_joint_pos_dual_arm"
@@ -189,6 +206,7 @@ class ZeroActionRolloutSim(ServoTeleoperatorSim):
             self._spawn_grasp_object()
             self._spawn_plates()
             self._randomize_task_objects()
+        self._set_initial_robot_state()
 
         self._setup_camera_pose()
         if self.render_preflight:
@@ -204,7 +222,27 @@ class ZeroActionRolloutSim(ServoTeleoperatorSim):
         if self.robot_uids != "piper":
             action_shape = self.env.action_space.shape[0]
             return np.zeros(action_shape, dtype=np.float32)
-        return np.zeros(8, dtype=np.float32)
+        return self.initial_env_action.copy()
+
+    def _validate_initial_state(self, initial_state) -> np.ndarray:
+        state = DEFAULT_INITIAL_STATE if initial_state is None else initial_state
+        state = np.asarray(state, dtype=np.float32).reshape(-1)
+        if state.shape != (7,):
+            raise ValueError(f"Expected --initial-state to contain 7 floats, got {state.shape}")
+        return state
+
+    def _set_initial_robot_state(self):
+        if self.robot_uids != "piper":
+            return
+        agent = getattr(self.env.unwrapped, "agent", None)
+        if agent is None:
+            raise RuntimeError("Cannot set initial robot state: env has no agent")
+        agent.reset(init_qpos=self.initial_env_action)
+        controller = getattr(agent, "controller", None)
+        reset_controller = getattr(controller, "reset", None)
+        if callable(reset_controller):
+            reset_controller()
+        print(f"[INFO] Set Piper initial state: {self.initial_state.tolist()}")
 
     def get_policy_observation(self, prompt: str, image_size: int):
         try:
@@ -514,6 +552,14 @@ def parse_args():
     )
     parser.add_argument("--object-size", type=float, default=0.04)
     parser.add_argument("--no-object", action="store_true")
+    parser.add_argument(
+        "--initial-state",
+        type=float,
+        nargs=7,
+        default=DEFAULT_INITIAL_STATE.tolist(),
+        metavar=("J1", "J2", "J3", "J4", "J5", "J6", "GRIPPER"),
+        help="Initial 7D Piper state: 6 arm joints plus one gripper value",
+    )
     parser.add_argument("--record", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--record-dir", type=str, default="./lerobot_data/eazy_sim_data")
     parser.add_argument("--repo-id", type=str, default="local/teleop_sim")
@@ -589,6 +635,7 @@ def main():
     else:
         print(f"Grasp object pos: {args.object_pos}")
         print(f"Grasp object size: {args.object_size} m")
+    print(f"Initial state: {np.asarray(args.initial_state, dtype=np.float32).tolist()}")
     print(f"Recording: {'enabled' if args.record else 'disabled'}")
     if args.record:
         print(f"Record dir: {os.path.expanduser(args.record_dir)}")
@@ -624,6 +671,7 @@ def main():
         record_fps=args.record_fps,
         rate=args.rate,
         display_cameras=not args.no_display_cameras,
+        initial_state=args.initial_state,
     )
 
     if not wait_for_human_start(sim, args.wait_for_start, args.policy_mode):
