@@ -44,6 +44,66 @@ DEFAULT_INITIAL_STATE = np.array(
 )
 
 
+class TimingStats:
+    def __init__(self, enabled: bool, interval: int, warmup: int, target_period: float):
+        self.enabled = enabled
+        self.interval = max(1, int(interval))
+        self.warmup = max(0, int(warmup))
+        self.target_period = target_period
+        self.step = 0
+        self.data = {}
+
+    @contextmanager
+    def time(self, key: str):
+        if not self.enabled:
+            yield
+            return
+        start = time.perf_counter()
+        try:
+            yield
+        finally:
+            self.record(key, time.perf_counter() - start)
+
+    def record(self, key: str, seconds: float):
+        if not self.enabled or self.step < self.warmup:
+            return
+        values = self.data.setdefault(key, [])
+        values.append(float(seconds) * 1000.0)
+
+    def end_step(self, label: str):
+        if not self.enabled:
+            return
+        self.step += 1
+        if self.step <= self.warmup:
+            return
+        measured_steps = self.step - self.warmup
+        if measured_steps % self.interval != 0:
+            return
+        self.print_summary(label, measured_steps)
+        self.data.clear()
+
+    def print_summary(self, label: str, measured_steps: int):
+        loop_values = self.data.get("loop.total", [])
+        avg_loop_ms = float(np.mean(loop_values)) if loop_values else 0.0
+        fps = 1000.0 / avg_loop_ms if avg_loop_ms > 0 else 0.0
+        target_ms = self.target_period * 1000.0
+        status = "OVERRUN" if avg_loop_ms > target_ms else "OK"
+        print(
+            f"[TIMING] {label} steps={measured_steps} "
+            f"avg_loop={avg_loop_ms:.1f}ms fps={fps:.1f} "
+            f"target={target_ms:.1f}ms {status}"
+        )
+        for key in sorted(self.data):
+            values = self.data[key]
+            if not values:
+                continue
+            print(
+                f"[TIMING]   {key}: "
+                f"avg={np.mean(values):.1f}ms max={np.max(values):.1f}ms "
+                f"last={values[-1]:.1f}ms n={len(values)}"
+            )
+
+
 class ZeroActionRolloutSim(ServoTeleoperatorSim):
     """Piper simulation rollout without serial or teleoperation threads."""
 
@@ -54,7 +114,7 @@ class ZeroActionRolloutSim(ServoTeleoperatorSim):
         object_pos=None,
         object_size: float = 0.04,
         spawn_object: bool = True,
-        render_mode: str = "human",
+        render_mode: str = "sensors",
         wrist_camera_width: int = 320,
         wrist_camera_height: int = 320,
         show_wrist_camera: bool = False,
@@ -74,6 +134,10 @@ class ZeroActionRolloutSim(ServoTeleoperatorSim):
         rate: float = 30.0,
         display_cameras: bool = True,
         initial_state=None,
+        debug_timing: bool = False,
+        debug_interval: int = 30,
+        debug_warmup: int = 5,
+        env_render: bool = True,
     ):
         self.SERIAL_PORT = None
         self.BAUDRATE = None
@@ -98,6 +162,7 @@ class ZeroActionRolloutSim(ServoTeleoperatorSim):
         self.rt_path_depth = rt_path_depth
         self.rt_denoiser = rt_denoiser
         self.render_preflight = render_preflight
+        self.env_render = env_render
         self.default_render_sensor_names = ("d435_top_camera", "wrist_camera")
         self.show_default_sensor_cameras = display_cameras
         self._camera_window_initialized = {}
@@ -120,6 +185,12 @@ class ZeroActionRolloutSim(ServoTeleoperatorSim):
         self.sim_init_angles = [0.0] * 7
         self.stop_event = Event()
         self.rate = float(rate)
+        self.timing = TimingStats(
+            enabled=debug_timing,
+            interval=debug_interval,
+            warmup=debug_warmup,
+            target_period=max(1.0 / self.rate, 1e-6),
+        )
         self.record_enabled = record
         self.record_dir = os.path.expanduser(record_dir)
         self.repo_id = repo_id
@@ -253,19 +324,24 @@ class ZeroActionRolloutSim(ServoTeleoperatorSim):
                 "environment, for example: pip install -e /workspace/openpi/packages/openpi-client"
             ) from exc
 
-        state = self._get_piper_record_state()
+        with self.timing.time("policy.get_state"):
+            state = self._get_piper_record_state()
         if state is None:
             raise RuntimeError("Failed to read Piper state from simulation")
 
-        sensor_images = self.env.unwrapped.get_sensor_images()
-        base_image = self._extract_policy_image(sensor_images, "d435_top_camera")
-        wrist_image = self._extract_policy_image(sensor_images, "wrist_camera")
-        base_image = image_tools.convert_to_uint8(
-            image_tools.resize_with_pad(base_image, image_size, image_size)
-        )
-        wrist_image = image_tools.convert_to_uint8(
-            image_tools.resize_with_pad(wrist_image, image_size, image_size)
-        )
+        with self.timing.time("policy.get_sensor_images"):
+            sensor_images = self.env.unwrapped.get_sensor_images()
+        with self.timing.time("policy.extract_base_image"):
+            base_image = self._extract_policy_image(sensor_images, "d435_top_camera")
+        with self.timing.time("policy.extract_wrist_image"):
+            wrist_image = self._extract_policy_image(sensor_images, "wrist_camera")
+        with self.timing.time("policy.resize_images"):
+            base_image = image_tools.convert_to_uint8(
+                image_tools.resize_with_pad(base_image, image_size, image_size)
+            )
+            wrist_image = image_tools.convert_to_uint8(
+                image_tools.resize_with_pad(wrist_image, image_size, image_size)
+            )
 
         return {
             "observation/state": state.astype(np.float32),
@@ -326,10 +402,28 @@ class ZeroActionRolloutSim(ServoTeleoperatorSim):
 
     def idle_step(self):
         """Advance physics and refresh render/camera windows before policy inference starts."""
-        self.env.step(self.zero_env_action())
-        self.env.render()
-        self._display_default_sensor_cameras()
-        self._display_wrist_camera()
+        with self.timing.time("idle.env_step"):
+            self.env.step(self.zero_env_action())
+        if self.env_render:
+            with self.timing.time("idle.env_render"):
+                self.env.render()
+        with self.timing.time("idle.display_cameras"):
+            self._display_default_sensor_cameras()
+            self._display_wrist_camera()
+
+    def rollout_step(self, env_action):
+        self._process_recording_events()
+        with self.timing.time("sim.env_step"):
+            self.env.step(env_action)
+        if self.env_render:
+            with self.timing.time("sim.env_render"):
+                self.env.render()
+        with self.timing.time("sim.display_cameras"):
+            self._display_default_sensor_cameras()
+            self._display_wrist_camera()
+        with self.timing.time("sim.record_frame"):
+            self._record_current_frame()
+        self._process_recording_events()
 
     def close_resources(self):
         if self.record_enabled and self.dataset is not None:
@@ -412,26 +506,35 @@ class ZeroActionRolloutSim(ServoTeleoperatorSim):
                         )
                     ):
                         actions_from_chunk_completed = 0
-                        obs = self.get_policy_observation(prompt, image_size)
-                        with prevent_keyboard_interrupt():
-                            response = policy_client.infer(obs)
-                        pred_action_chunk = self.validate_action_chunk(response)
+                        with self.timing.time("policy.get_observation_total"):
+                            obs = self.get_policy_observation(prompt, image_size)
+                        with self.timing.time("policy.infer"):
+                            with prevent_keyboard_interrupt():
+                                response = policy_client.infer(obs)
+                        with self.timing.time("policy.validate_chunk"):
+                            pred_action_chunk = self.validate_action_chunk(response)
                     policy_action = pred_action_chunk[actions_from_chunk_completed]
                     actions_from_chunk_completed += 1
-                    env_action = self.policy_action_to_env_action(policy_action, action_mode)
+                    with self.timing.time("action.convert"):
+                        env_action = self.policy_action_to_env_action(policy_action, action_mode)
                 else:
                     raise ValueError(f"Unsupported policy mode: {policy_mode}")
 
-                self.teleop_sim_handler(env_action, dwell=0.0)
+                loop_start = time.perf_counter()
+                self.rollout_step(env_action)
                 step_count += 1
                 if max_steps is not None and step_count >= max_steps:
                     break
                 next_time += period
                 sleep_dt = next_time - time.monotonic()
                 if sleep_dt > 0:
+                    sleep_start = time.perf_counter()
                     time.sleep(sleep_dt)
+                    self.timing.record("loop.sleep", time.perf_counter() - sleep_start)
                 else:
                     next_time = time.monotonic()
+                self.timing.record("loop.total", time.perf_counter() - loop_start)
+                self.timing.end_step(policy_mode)
         except KeyboardInterrupt:
             print("Received interrupt signal, preparing to stop...")
         finally:
@@ -524,8 +627,14 @@ def parse_args():
     parser.add_argument(
         "--render-mode",
         type=str,
-        default="human",
+        default="sensors",
         choices=["human", "rgb_array", "sensors", "all"],
+    )
+    parser.add_argument(
+        "--env-render",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Call env.render() each step; disable to show only OpenCV camera windows",
     )
     parser.add_argument(
         "--shader-pack",
@@ -560,6 +669,19 @@ def parse_args():
         metavar=("J1", "J2", "J3", "J4", "J5", "J6", "GRIPPER"),
         help="Initial 7D Piper state: 6 arm joints plus one gripper value",
     )
+    parser.add_argument("--debug-timing", action="store_true", help="Print rollout timing diagnostics")
+    parser.add_argument(
+        "--debug-interval",
+        type=int,
+        default=30,
+        help="Print timing summary every N measured steps",
+    )
+    parser.add_argument(
+        "--debug-warmup",
+        type=int,
+        default=5,
+        help="Skip the first N steps when collecting timing diagnostics",
+    )
     parser.add_argument("--record", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--record-dir", type=str, default="./lerobot_data/eazy_sim_data")
     parser.add_argument("--repo-id", type=str, default="local/teleop_sim")
@@ -583,6 +705,7 @@ def wait_for_human_start(sim: ZeroActionRolloutSim, enabled: bool, policy_mode: 
     next_time = time.monotonic()
     try:
         while not sim.stop_event.is_set():
+            loop_start = time.perf_counter()
             sim.idle_step()
             if sim.pending_quit:
                 sim.stop_event.set()
@@ -593,9 +716,13 @@ def wait_for_human_start(sim: ZeroActionRolloutSim, enabled: bool, policy_mode: 
             next_time += period
             sleep_dt = next_time - time.monotonic()
             if sleep_dt > 0:
+                sleep_start = time.perf_counter()
                 time.sleep(sleep_dt)
+                sim.timing.record("idle.sleep", time.perf_counter() - sleep_start)
             else:
                 next_time = time.monotonic()
+            sim.timing.record("loop.total", time.perf_counter() - loop_start)
+            sim.timing.end_step("idle")
     except KeyboardInterrupt:
         print("Received interrupt signal before inference start.")
         return False
@@ -607,6 +734,11 @@ def main():
     record_cameras = tuple(
         camera.strip() for camera in args.record_cameras.split(",") if camera.strip()
     )
+    if not args.env_render and args.render_mode == "human":
+        print(
+            "[WARN] --no-env-render skips per-step env.render(), but --render-mode human "
+            "may still create a SAPIEN viewer. Use --render-mode sensors to hide it."
+        )
 
     print("=" * 60)
     print("    Piper Simulation Rollout")
@@ -620,8 +752,9 @@ def main():
         print(f"Open-loop horizon: {args.open_loop_horizon}")
         print(f"Policy image size: {args.image_size}")
         print(f"Action mode: {args.action_mode}")
-        print(f"Prompt: {args.prompt}")
+    print(f"Prompt: {args.prompt}")
     print(f"Render mode: {args.render_mode}")
+    print(f"Env render: {'enabled' if args.env_render else 'disabled'}")
     print(f"Shader pack: {args.shader_pack} ({normalize_shader_pack(args.shader_pack)})")
     print(f"RT samples: {args.rt_samples_per_pixel}")
     print(f"RT path depth: {args.rt_path_depth}")
@@ -636,6 +769,7 @@ def main():
         print(f"Grasp object pos: {args.object_pos}")
         print(f"Grasp object size: {args.object_size} m")
     print(f"Initial state: {np.asarray(args.initial_state, dtype=np.float32).tolist()}")
+    print(f"Debug timing: {'enabled' if args.debug_timing else 'disabled'}")
     print(f"Recording: {'enabled' if args.record else 'disabled'}")
     if args.record:
         print(f"Record dir: {os.path.expanduser(args.record_dir)}")
@@ -672,6 +806,10 @@ def main():
         rate=args.rate,
         display_cameras=not args.no_display_cameras,
         initial_state=args.initial_state,
+        debug_timing=args.debug_timing,
+        debug_interval=args.debug_interval,
+        debug_warmup=args.debug_warmup,
+        env_render=args.env_render,
     )
 
     if not wait_for_human_start(sim, args.wait_for_start, args.policy_mode):

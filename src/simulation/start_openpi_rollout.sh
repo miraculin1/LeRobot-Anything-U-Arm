@@ -7,6 +7,7 @@ source /home/ros/miniforge3/bin/activate
 conda activate uarm
 
 python src/simulation/rollout_sim.py \
+    --debug-timing \
     --robot piper \
     --policy-mode openpi \
     --host localhost \
@@ -14,4 +15,7 @@ python src/simulation/rollout_sim.py \
     --prompt "put red box to blue plate" \
     --open-loop-horizon 10 \
     --action-mode delta \
+    --render-mode sensors \
+    --no-env-render \
+    --no-render-preflight \
     --no-record
