@@ -10,7 +10,7 @@ import re
 import gymnasium as gym
 import mani_skill.envs  # Must import to register all env/agent
 from threading import Event, Thread, Lock
-from queue import Queue, Empty
+from queue import Queue, Empty, Full
 import torch
 import sapien
 import argparse
@@ -147,6 +147,7 @@ class ServoTeleoperatorSim:
                  record_fps: int = 30,
                  image_writer_processes: int = 0,
                  image_writer_threads: int = 4,
+                 raw_writer_queue_size: int = 256,
                  env_render: bool = True,
                  control_dwell: float = 0.0,
                  debug_timing: bool = False,
@@ -237,7 +238,12 @@ class ServoTeleoperatorSim:
         self.record_fps = int(record_fps)
         self.record_period = 1.0 / max(float(self.record_fps), 1.0)
         self.image_writer_processes = max(0, int(image_writer_processes))
-        self.image_writer_threads = max(0, int(image_writer_threads))
+        self.image_writer_threads = max(1, int(image_writer_threads))
+        self.raw_writer_queue_size = max(1, int(raw_writer_queue_size))
+        self.raw_writer_queue = None
+        self.raw_writer_threads = []
+        self.raw_writer_errors = []
+        self.raw_writer_backpressure_warned = False
         self.raw_dataset_root = None
         self.current_episode_index = 0
         self.current_episode_dir = None
@@ -730,11 +736,84 @@ class ServoTeleoperatorSim:
                     "Supported cameras: d435_top_camera,wrist_camera"
                 )
         print(f"[INFO] Raw recording root: {self.raw_dataset_root}")
-        if self.image_writer_processes or self.image_writer_threads:
+        if self.image_writer_processes:
             print(
-                "[WARN] --image-writer-processes/--image-writer-threads are ignored "
-                "for raw recording. Use convert_raw_to_lerobot.py for LeRobot output."
+                "[WARN] --image-writer-processes is ignored for raw recording; "
+                "--image-writer-threads controls raw PNG writer threads."
             )
+        self._start_raw_writer()
+        print(
+            "[INFO] Raw async image writer enabled: "
+            f"threads={self.image_writer_threads}, queue_size={self.raw_writer_queue_size}"
+        )
+
+    def _start_raw_writer(self):
+        if self.raw_writer_queue is not None:
+            return
+        self.raw_writer_queue = Queue(maxsize=self.raw_writer_queue_size)
+        self.raw_writer_threads = []
+        self.raw_writer_errors = []
+        for index in range(self.image_writer_threads):
+            thread = Thread(
+                target=self._raw_writer_loop,
+                name=f"raw-image-writer-{index}",
+                daemon=True,
+            )
+            thread.start()
+            self.raw_writer_threads.append(thread)
+
+    def _raw_writer_loop(self):
+        while True:
+            job = self.raw_writer_queue.get()
+            try:
+                if job is None:
+                    return
+                for _camera_name, frame, abs_path in job:
+                    bgr_frame = self.cv2.cvtColor(frame, self.cv2.COLOR_RGB2BGR)
+                    if not self.cv2.imwrite(abs_path, bgr_frame):
+                        raise RuntimeError(f"Failed to write raw camera frame: {abs_path}")
+            except Exception as exc:
+                with self.record_lock:
+                    self.raw_writer_errors.append(str(exc))
+            finally:
+                self.raw_writer_queue.task_done()
+
+    def _enqueue_raw_image_write(self, job):
+        if self.raw_writer_queue is None:
+            raise RuntimeError("Raw writer queue is not initialized")
+        try:
+            self.raw_writer_queue.put(job, timeout=0.001)
+        except Full:
+            if not self.raw_writer_backpressure_warned:
+                print(
+                    "[WARN] Raw image writer queue is full; blocking control loop until "
+                    "disk writer catches up."
+                )
+                self.raw_writer_backpressure_warned = True
+            self.raw_writer_queue.put(job)
+
+    def _wait_raw_writer(self, raise_errors=True):
+        if self.raw_writer_queue is not None:
+            self.raw_writer_queue.join()
+        with self.record_lock:
+            errors = list(self.raw_writer_errors)
+            self.raw_writer_errors = []
+        if errors and raise_errors:
+            raise RuntimeError("Raw image writer failed: " + "; ".join(errors[:3]))
+        if errors:
+            print("[WARN] Raw image writer errors ignored during cleanup: " + "; ".join(errors[:3]))
+
+    def _stop_raw_writer(self):
+        if self.raw_writer_queue is None:
+            return
+        self._wait_raw_writer(raise_errors=False)
+        for _thread in self.raw_writer_threads:
+            self.raw_writer_queue.put(None)
+        self.raw_writer_queue.join()
+        for thread in self.raw_writer_threads:
+            thread.join(timeout=2.0)
+        self.raw_writer_queue = None
+        self.raw_writer_threads = []
 
     def _begin_recording_episode(self):
         episode_index = self._next_raw_episode_index()
@@ -833,6 +912,7 @@ class ServoTeleoperatorSim:
             return
         episode_index = self._current_dataset_episode_index()
         print(f"[RECORD] Saving episode {episode_index} ({self.current_episode_frames} frames)...")
+        self._wait_raw_writer()
         meta = {
             "format": "uarm_sim_raw_v1",
             "episode_index": episode_index,
@@ -860,6 +940,7 @@ class ServoTeleoperatorSim:
         self._reset_current_episode_buffer()
 
     def _clear_current_episode_buffer(self):
+        self._wait_raw_writer(raise_errors=False)
         if self.current_episode_dir and os.path.isdir(self.current_episode_dir):
             shutil.rmtree(self.current_episode_dir)
         self._reset_current_episode_buffer()
@@ -948,9 +1029,9 @@ class ServoTeleoperatorSim:
             frame = np.clip(frame, 0, 255).astype(np.uint8)
         return frame
 
-    def _collect_sensor_frames(self, sensor_names):
+    def _collect_camera_frames(self, sensor_names):
         sensor_images = self.env.unwrapped.get_sensor_images()
-        frames = []
+        frames = {}
         for sensor_name in sensor_names:
             images = sensor_images.get(sensor_name)
             if not images:
@@ -958,22 +1039,26 @@ class ServoTeleoperatorSim:
             frame = images.get("rgb")
             if frame is None:
                 frame = next(iter(images.values()))
-            frame = self._sensor_frame_to_bgr(frame)
+            frame = self._sensor_frame_to_rgb(frame)
             if frame is not None:
-                frames.append(frame)
+                frames[sensor_name] = frame
         return frames
 
-    def _collect_record_camera_frames(self):
-        sensor_images = self.env.unwrapped.get_sensor_images()
+    def _camera_frames_to_bgr_list(self, camera_frames, sensor_names):
+        frames = []
+        for sensor_name in sensor_names:
+            frame = camera_frames.get(sensor_name)
+            if frame is None:
+                continue
+            frames.append(self.cv2.cvtColor(frame, self.cv2.COLOR_RGB2BGR))
+        return frames
+
+    def _collect_record_camera_frames(self, camera_frames=None):
+        if camera_frames is None:
+            camera_frames = self._collect_camera_frames(self.record_cameras)
         frames = {}
         for sensor_name in self.record_cameras:
-            images = sensor_images.get(sensor_name)
-            if not images:
-                return None
-            frame = images.get("rgb")
-            if frame is None:
-                frame = next(iter(images.values()))
-            frame = self._sensor_frame_to_rgb(frame)
+            frame = camera_frames.get(sensor_name)
             if frame is None:
                 return None
             frames[f"observation.images.{sensor_name}"] = frame
@@ -997,7 +1082,7 @@ class ServoTeleoperatorSim:
             state[6] = float(qpos[6])
         return state
 
-    def _record_current_frame(self):
+    def _record_current_frame(self, camera_frames=None):
         if not self.record_enabled:
             return
         with self.record_lock:
@@ -1008,9 +1093,12 @@ class ServoTeleoperatorSim:
             return
         with NullTimer(self.timing, "record.state"):
             state = self._get_piper_record_state()
-        with NullTimer(self.timing, "record.cameras"):
-            camera_frames = self._collect_record_camera_frames()
-        if state is None or camera_frames is None:
+        if camera_frames is None:
+            with NullTimer(self.timing, "record.cameras"):
+                record_camera_frames = self._collect_record_camera_frames()
+        else:
+            record_camera_frames = self._collect_record_camera_frames(camera_frames)
+        if state is None or record_camera_frames is None:
             return
         with self.record_lock:
             teleop_target = None if self.latest_teleop_target is None else self.latest_teleop_target.copy()
@@ -1021,16 +1109,16 @@ class ServoTeleoperatorSim:
         frame_index = self.current_episode_frames
         timestamp = self.current_episode_frames / float(self.record_fps)
         image_paths = {}
-        with NullTimer(self.timing, "record.write_frame"):
-            for camera_key, frame in camera_frames.items():
+        write_job = []
+        with NullTimer(self.timing, "record.enqueue_frame"):
+            for camera_key, frame in record_camera_frames.items():
                 camera_name = camera_key.split(".")[-1]
                 rel_path = os.path.join("images", camera_name, f"frame_{frame_index:06d}.png")
                 abs_path = os.path.join(episode_dir, rel_path)
-                bgr_frame = self.cv2.cvtColor(frame, self.cv2.COLOR_RGB2BGR)
-                if not self.cv2.imwrite(abs_path, bgr_frame):
-                    raise RuntimeError(f"Failed to write raw camera frame: {abs_path}")
                 image_paths[camera_name] = rel_path
                 self.current_episode_camera_shapes[camera_name] = list(frame.shape)
+                write_job.append((camera_name, np.ascontiguousarray(frame).copy(), abs_path))
+            self._enqueue_raw_image_write(write_job)
             self.current_episode_frames_data.append(
                 {
                     "frame_index": frame_index,
@@ -1162,7 +1250,7 @@ class ServoTeleoperatorSim:
         elif key == ord("q"):
             self._request_quit()
 
-    def _display_default_sensor_cameras(self):
+    def _display_default_sensor_cameras(self, camera_frames=None):
         """Display the default top-down D435 camera and wrist camera when available."""
         if not self.show_default_sensor_cameras:
             return
@@ -1170,15 +1258,34 @@ class ServoTeleoperatorSim:
         if now - self._last_wrist_camera_display_time < self.wrist_camera_display_period:
             return
         self._last_wrist_camera_display_time = now
-        frames = self._collect_sensor_frames(self.default_render_sensor_names)
+        if camera_frames is None:
+            camera_frames = self._collect_camera_frames(self.default_render_sensor_names)
+        frames = self._camera_frames_to_bgr_list(camera_frames, self.default_render_sensor_names)
         self._display_camera_frames("default_sensor_cameras", frames)
 
-    def _display_wrist_camera(self):
+    def _display_wrist_camera(self, camera_frames=None):
         """Display the piper wrist camera in a separate OpenCV window."""
         if not self.show_wrist_camera:
             return
-        frames = self._collect_sensor_frames(("wrist_camera",))
+        if camera_frames is None:
+            camera_frames = self._collect_camera_frames(("wrist_camera",))
+        frames = self._camera_frames_to_bgr_list(camera_frames, ("wrist_camera",))
         self._display_camera_frames("wrist_camera", frames)
+
+    def _should_record_this_step(self):
+        if not self.record_enabled:
+            return False
+        with self.record_lock:
+            if self.record_state != "recording":
+                return False
+        now = time.monotonic()
+        return not (self.last_record_time and now - self.last_record_time < self.record_period)
+
+    def _should_display_default_cameras_this_step(self):
+        if not self.show_default_sensor_cameras:
+            return False
+        now = time.monotonic()
+        return now - self._last_wrist_camera_display_time >= self.wrist_camera_display_period
 
     def teleop_sim_handler(self, action: np.ndarray):
         """Simulation control handler function
@@ -1197,11 +1304,25 @@ class ServoTeleoperatorSim:
         if self.env_render:
             with NullTimer(self.timing, "sim.env_render"):
                 self.env.render()
+        needs_record_cameras = self._should_record_this_step()
+        needs_default_display = self._should_display_default_cameras_this_step()
+        needs_wrist_display = self.show_wrist_camera
+        step_camera_frames = None
+        if needs_record_cameras or needs_default_display or needs_wrist_display:
+            sensor_names = set()
+            if needs_record_cameras:
+                sensor_names.update(self.record_cameras)
+            if needs_default_display:
+                sensor_names.update(self.default_render_sensor_names)
+            if needs_wrist_display:
+                sensor_names.add("wrist_camera")
+            with NullTimer(self.timing, "step.cameras"):
+                step_camera_frames = self._collect_camera_frames(tuple(sensor_names))
         with NullTimer(self.timing, "sim.display_cameras"):
-            self._display_default_sensor_cameras()
-            self._display_wrist_camera()
+            self._display_default_sensor_cameras(step_camera_frames)
+            self._display_wrist_camera(step_camera_frames)
         with NullTimer(self.timing, "sim.record_frame"):
-            self._record_current_frame()
+            self._record_current_frame(step_camera_frames)
         self._process_recording_events()
         if self.control_dwell > 0:
             sleep_start = time.perf_counter()
@@ -1337,6 +1458,11 @@ class ServoTeleoperatorSim:
             if self.command_thread is not None:
                 self.command_thread.join(timeout=0.2)
             print("All threads stopped")
+            if self.record_enabled:
+                try:
+                    self._stop_raw_writer()
+                except Exception as exc:
+                    print(f"[WARN] Raw writer shutdown failed: {exc}")
             self.env.close()
             self.ser.close()
             if self.cv2 is not None:
@@ -1517,7 +1643,13 @@ if __name__ == "__main__":
         '--image-writer-threads',
         type=int,
         default=4,
-        help='Deprecated for raw recording; ignored by --record'
+        help='Raw PNG writer thread count'
+    )
+    parser.add_argument(
+        '--raw-writer-queue-size',
+        type=int,
+        default=256,
+        help='Maximum queued raw image write jobs before recording applies backpressure'
     )
     parser.add_argument(
         '--debug-timing',
@@ -1581,6 +1713,7 @@ if __name__ == "__main__":
         print(f"Task:             put red box to blue plate")
         print(f"Record cameras:   {record_cameras}")
         print(f"Record FPS:       {args.record_fps}")
+        print(f"Raw writer:       {max(1, args.image_writer_threads)} threads, queue={args.raw_writer_queue_size}")
         print("Record format:    raw uarm_sim_raw_v1")
     print("-" * 60)
     
@@ -1612,6 +1745,7 @@ if __name__ == "__main__":
             record_fps=args.record_fps,
             image_writer_processes=args.image_writer_processes,
             image_writer_threads=args.image_writer_threads,
+            raw_writer_queue_size=args.raw_writer_queue_size,
             env_render=args.env_render,
             control_dwell=args.control_dwell,
             debug_timing=args.debug_timing,

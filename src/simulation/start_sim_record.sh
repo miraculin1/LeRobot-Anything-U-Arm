@@ -20,4 +20,5 @@ python src/simulation/teleop_sim.py \
     --record-cameras d435_top_camera,wrist_camera \
     --record-fps 30 \
     --image-writer-processes 0 \
-    --image-writer-threads 8
+    --image-writer-threads 8 \
+    --raw-writer-queue-size 256
