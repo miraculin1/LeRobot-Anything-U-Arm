@@ -4,6 +4,7 @@ import select
 import signal
 import sys
 import time
+from collections import deque
 from contextlib import contextmanager
 from threading import Event, Lock, Thread
 
@@ -138,6 +139,9 @@ class ZeroActionRolloutSim(ServoTeleoperatorSim):
         debug_interval: int = 30,
         debug_warmup: int = 5,
         env_render: bool = True,
+        show_gripper_plot: bool = True,
+        gripper_plot_history: int = 300,
+        gripper_contact_force_threshold: float = 1e-3,
     ):
         self.SERIAL_PORT = None
         self.BAUDRATE = None
@@ -163,6 +167,13 @@ class ZeroActionRolloutSim(ServoTeleoperatorSim):
         self.rt_denoiser = rt_denoiser
         self.render_preflight = render_preflight
         self.env_render = env_render
+        self.show_gripper_plot = show_gripper_plot
+        self.gripper_plot_history = max(int(gripper_plot_history), 1)
+        self.gripper_contact_force_threshold = max(float(gripper_contact_force_threshold), 0.0)
+        self._gripper_plot = None
+        self._gripper_plot_step = deque(maxlen=self.gripper_plot_history)
+        self._gripper_plot_state = deque(maxlen=self.gripper_plot_history)
+        self._gripper_plot_policy_action = deque(maxlen=self.gripper_plot_history)
         self.default_render_sensor_names = ("d435_top_camera", "wrist_camera")
         self.show_default_sensor_cameras = display_cameras
         self._camera_window_initialized = {}
@@ -425,7 +436,117 @@ class ZeroActionRolloutSim(ServoTeleoperatorSim):
             self._record_current_frame()
         self._process_recording_events()
 
+    def _init_gripper_plot(self):
+        if self._gripper_plot is not None:
+            return
+        try:
+            import matplotlib.pyplot as plt
+        except ImportError as exc:
+            raise RuntimeError(
+                "Gripper plot display requires matplotlib. Install matplotlib "
+                "in this environment, then run again."
+            ) from exc
+
+        plt.ion()
+        fig, axes = plt.subplots(2, 1, figsize=(9, 6), sharex=True)
+        manager = getattr(fig.canvas, "manager", None)
+        if manager is not None:
+            manager.set_window_title("rollout gripper monitor")
+        state_line, = axes[0].plot([], [], color="tab:blue", label="gripper opening")
+        action_line, = axes[1].plot([], [], color="tab:orange", label="policy action grip")
+        axes[0].set_ylabel("opening (m)")
+        axes[1].set_ylabel("policy action")
+        axes[1].set_xlabel("rollout step")
+        for ax in axes:
+            ax.grid(True, alpha=0.3)
+            ax.legend(loc="upper right")
+        contact_text = fig.text(
+            0.5,
+            0.95,
+            "left contact: NO | right contact: NO",
+            ha="center",
+            va="center",
+            fontsize=12,
+        )
+        fig.tight_layout(rect=(0, 0, 1, 0.92))
+        fig.show()
+        self._gripper_plot = dict(
+            plt=plt,
+            fig=fig,
+            axes=axes,
+            state_line=state_line,
+            action_line=action_line,
+            contact_text=contact_text,
+        )
+
+    def _get_gripper_object_contacts(self):
+        if not self.spawn_object or self.grasp_object is None:
+            return False, False, 0.0, 0.0
+        agent = getattr(self.env.unwrapped, "agent", None)
+        if agent is None:
+            return False, False, 0.0, 0.0
+        links_map = getattr(agent.robot, "links_map", {})
+        left_link = links_map.get("link7")
+        right_link = links_map.get("link8")
+        if left_link is None or right_link is None:
+            return False, False, 0.0, 0.0
+        try:
+            scene = self.env.unwrapped.scene
+            left_force = scene.get_pairwise_contact_forces(self.grasp_object, left_link)
+            right_force = scene.get_pairwise_contact_forces(self.grasp_object, right_link)
+        except (AttributeError, IndexError, RuntimeError):
+            return False, False, 0.0, 0.0
+
+        left_force = np.asarray(left_force.detach().cpu(), dtype=np.float32).reshape(-1, 3)
+        right_force = np.asarray(right_force.detach().cpu(), dtype=np.float32).reshape(-1, 3)
+        left_norm = float(np.linalg.norm(left_force, axis=1).max(initial=0.0))
+        right_norm = float(np.linalg.norm(right_force, axis=1).max(initial=0.0))
+        threshold = self.gripper_contact_force_threshold
+        return left_norm > threshold, right_norm > threshold, left_norm, right_norm
+
+    def _update_gripper_plot(self, step_count: int, state, policy_action):
+        if not self.show_gripper_plot:
+            return
+        self._init_gripper_plot()
+        plot = self._gripper_plot
+        if not plot["plt"].fignum_exists(plot["fig"].number):
+            self.show_gripper_plot = False
+            return
+
+        state = None if state is None else np.asarray(state, dtype=np.float32).reshape(-1)
+        policy_action = np.asarray(policy_action, dtype=np.float32).reshape(-1)
+        gripper_state = float(state[6]) if state is not None and state.size >= 7 else np.nan
+        gripper_policy_action = float(policy_action[6]) if policy_action.size >= 7 else np.nan
+        left_contact, right_contact, left_force, right_force = self._get_gripper_object_contacts()
+
+        self._gripper_plot_step.append(step_count)
+        self._gripper_plot_state.append(gripper_state)
+        self._gripper_plot_policy_action.append(gripper_policy_action)
+        xs = np.asarray(self._gripper_plot_step, dtype=np.float32)
+        ys_state = np.asarray(self._gripper_plot_state, dtype=np.float32)
+        ys_action = np.asarray(self._gripper_plot_policy_action, dtype=np.float32)
+
+        plot["state_line"].set_data(xs, ys_state)
+        plot["action_line"].set_data(xs, ys_action)
+        for ax in plot["axes"]:
+            ax.relim()
+            ax.autoscale_view()
+        plot["contact_text"].set_text(
+            "left contact: {} ({:.3f} N) | right contact: {} ({:.3f} N)".format(
+                "YES" if left_contact else "NO",
+                left_force,
+                "YES" if right_contact else "NO",
+                right_force,
+            )
+        )
+        plot["fig"].canvas.draw_idle()
+        plot["fig"].canvas.flush_events()
+        plot["plt"].pause(0.001)
+
     def close_resources(self):
+        if self._gripper_plot is not None:
+            self._gripper_plot["plt"].close(self._gripper_plot["fig"])
+            self._gripper_plot = None
         if self.record_enabled and self.dataset is not None:
             finalize = getattr(self.dataset, "finalize", None)
             if callable(finalize):
@@ -497,6 +618,7 @@ class ZeroActionRolloutSim(ServoTeleoperatorSim):
         try:
             while not self.stop_event.is_set():
                 if policy_mode == "zero":
+                    policy_action = self.zero_policy_action()
                     env_action = self.zero_env_action()
                 elif policy_mode == "openpi":
                     if (
@@ -523,6 +645,9 @@ class ZeroActionRolloutSim(ServoTeleoperatorSim):
                 loop_start = time.perf_counter()
                 self.rollout_step(env_action)
                 step_count += 1
+                state = self._get_piper_record_state()
+                with self.timing.time("sim.update_gripper_plot"):
+                    self._update_gripper_plot(step_count, state, policy_action)
                 if max_steps is not None and step_count >= max_steps:
                     break
                 next_time += period
@@ -650,6 +775,24 @@ def parse_args():
     parser.add_argument("--wrist-camera-height", type=int, default=320)
     parser.add_argument("--show-wrist-camera", action="store_true")
     parser.add_argument("--no-display-cameras", action="store_true")
+    parser.add_argument(
+        "--show-gripper-plot",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Show a live Matplotlib plot of gripper opening, policy action, and contacts",
+    )
+    parser.add_argument(
+        "--gripper-plot-history",
+        type=int,
+        default=300,
+        help="Number of recent rollout steps to keep in the gripper plot",
+    )
+    parser.add_argument(
+        "--gripper-contact-force-threshold",
+        type=float,
+        default=1e-3,
+        help="Minimum pairwise contact force in N required to mark gripper-object contact",
+    )
     parser.add_argument("--wrist-camera-display-rate", type=float, default=10.0)
     parser.add_argument("--wrist-camera-display-scale", type=float, default=2.0)
     parser.add_argument(
@@ -763,6 +906,8 @@ def main():
     print(f"Wrist camera: {args.wrist_camera_width}x{args.wrist_camera_height}")
     print(f"Wrist display: {'enabled' if args.show_wrist_camera else 'disabled'}")
     print(f"Default camera display: {'disabled' if args.no_display_cameras else 'enabled'}")
+    print(f"Gripper plot: {'enabled' if args.show_gripper_plot else 'disabled'}")
+    print(f"Gripper contact force threshold: {args.gripper_contact_force_threshold} N")
     if args.no_object:
         print("Grasp object: disabled")
     else:
@@ -810,6 +955,9 @@ def main():
         debug_interval=args.debug_interval,
         debug_warmup=args.debug_warmup,
         env_render=args.env_render,
+        show_gripper_plot=args.show_gripper_plot,
+        gripper_plot_history=args.gripper_plot_history,
+        gripper_contact_force_threshold=args.gripper_contact_force_threshold,
     )
 
     if not wait_for_human_start(sim, args.wait_for_start, args.policy_mode):
