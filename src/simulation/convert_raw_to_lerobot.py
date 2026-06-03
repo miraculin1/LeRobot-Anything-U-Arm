@@ -41,6 +41,15 @@ def find_raw_episodes(raw_root: Path) -> List[Path]:
     return episodes
 
 
+def resolve_output_root(output_parent: Path, output_repo_id: str) -> Path:
+    repo_path = Path(output_repo_id)
+    if repo_path.is_absolute() or any(part == ".." for part in repo_path.parts):
+        raise ValueError(
+            "--output-repo-id must be a relative repo id such as 'local/teleop_sim'"
+        )
+    return (output_parent.expanduser().resolve() / repo_path).resolve()
+
+
 def read_rgb_image(path: Path) -> np.ndarray:
     image = cv2.imread(str(path), cv2.IMREAD_COLOR)
     if image is None:
@@ -70,7 +79,12 @@ def infer_camera_shapes(
 
 
 def create_lerobot_dataset(
-    output_root: Path, output_repo_id: str, fps: int, camera_shapes: dict
+    output_root: Path,
+    output_repo_id: str,
+    fps: int,
+    camera_shapes: dict,
+    image_writer_processes: int,
+    image_writer_threads: int,
 ):
     try:
         from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -106,6 +120,8 @@ def create_lerobot_dataset(
         root=output_root,
         robot_type="piper",
         use_videos=False,
+        image_writer_processes=image_writer_processes,
+        image_writer_threads=image_writer_threads,
     )
 
 
@@ -217,7 +233,7 @@ def parse_args():
         "--output-dir",
         required=True,
         type=Path,
-        help="Output LeRobot dataset root path, usually <parent>/<repo-id>",
+        help="Output parent directory. Dataset is written to <output-dir>/<output-repo-id>",
     )
     parser.add_argument(
         "--output-repo-id",
@@ -241,13 +257,30 @@ def parse_args():
     parser.add_argument(
         "--force", action="store_true", help="Delete existing output directory first"
     )
+    parser.add_argument(
+        "--image-writer-processes",
+        type=int,
+        default=0,
+        help="Number of async image writer processes used by LeRobotDataset",
+    )
+    parser.add_argument(
+        "--image-writer-threads",
+        type=int,
+        default=8,
+        help="Number of async image writer threads used by LeRobotDataset. Use 0 to disable.",
+    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
     raw_root = args.raw_dir.expanduser().resolve()
-    output_root = args.output_dir.expanduser().resolve()
+    output_root = resolve_output_root(args.output_dir, args.output_repo_id)
+
+    if args.image_writer_processes < 0 or args.image_writer_threads < 0:
+        raise ValueError(
+            "--image-writer-processes and --image-writer-threads must be non-negative"
+        )
 
     episodes = find_raw_episodes(raw_root)
     first_meta = json.loads((episodes[0] / "meta.json").read_text(encoding="utf-8"))
@@ -264,7 +297,12 @@ def main():
     output_root.parent.mkdir(parents=True, exist_ok=True)
 
     dataset = create_lerobot_dataset(
-        output_root, args.output_repo_id, fps, camera_shapes
+        output_root,
+        args.output_repo_id,
+        fps,
+        camera_shapes,
+        args.image_writer_processes,
+        args.image_writer_threads,
     )
     for episode_dir in episodes:
         convert_episode(dataset, episode_dir, args.task, args.action_source)
