@@ -1,4 +1,5 @@
 import copy
+import json
 import os
 import shutil
 import serial
@@ -237,7 +238,13 @@ class ServoTeleoperatorSim:
         self.record_period = 1.0 / max(float(self.record_fps), 1.0)
         self.image_writer_processes = max(0, int(image_writer_processes))
         self.image_writer_threads = max(0, int(image_writer_threads))
-        self.dataset = None
+        self.raw_dataset_root = None
+        self.current_episode_index = 0
+        self.current_episode_dir = None
+        self.current_episode_frames_data = []
+        self.current_episode_camera_shapes = {}
+        self.current_episode_started_at = None
+        self.latest_teleop_target = None
         self.record_state = "disabled" if not self.record_enabled else "initializing"
         self.record_lock = Lock()
         self.pending_stop_episode = False
@@ -342,7 +349,7 @@ class ServoTeleoperatorSim:
         if self.render_preflight:
             self._run_render_preflight()
         if self.record_enabled:
-            self._setup_lerobot_dataset()
+            self._setup_raw_recorder()
             self._begin_recording_episode()
 
 
@@ -702,96 +709,42 @@ class ServoTeleoperatorSim:
         """Default angle sending callback (for debugging)"""
         print(f"Servo angles (degrees): {np.degrees(arm_pos)}")
 
-    def _setup_lerobot_dataset(self):
+    def _setup_raw_recorder(self):
         if self.robot_uids != "piper":
             raise ValueError("--record is currently implemented for --robot piper only")
         if self.record_fps <= 0:
             raise ValueError("--record-fps must be positive")
-        try:
-            from lerobot.datasets.lerobot_dataset import LeRobotDataset
-        except ImportError as exc:
+        self.raw_dataset_root = os.path.join(self.record_dir, self.repo_id)
+        if os.path.exists(os.path.join(self.raw_dataset_root, "meta", "info.json")):
             raise RuntimeError(
-                "Recording requires lerobot in the active Python environment. "
-                "Install the project requirements or run with the uarm conda environment."
-            ) from exc
+                f"Record root looks like an existing LeRobot dataset: {self.raw_dataset_root}. "
+                "Use a raw-data directory for --record-dir, then convert with convert_raw_to_lerobot.py."
+            )
+        os.makedirs(os.path.join(self.raw_dataset_root, "episodes"), exist_ok=True)
 
-        dataset_root = os.path.join(self.record_dir, self.repo_id)
-        os.makedirs(os.path.dirname(dataset_root), exist_ok=True)
-        features = {
-            "observation.state": {
-                "dtype": "float32",
-                "shape": (7,),
-                "names": ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6", "gripper"],
-            },
-            "action": {
-                "dtype": "float32",
-                "shape": (7,),
-                "names": ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6", "gripper"],
-            },
-        }
-        camera_shapes = {
-            "d435_top_camera": (480, 640, 3),
-            "wrist_camera": (self.wrist_camera_height, self.wrist_camera_width, 3),
-        }
+        camera_shapes = self._expected_record_camera_shapes()
         for camera_name in self.record_cameras:
             if camera_name not in camera_shapes:
                 raise ValueError(
                     f"Unsupported --record-cameras entry '{camera_name}'. "
                     "Supported cameras: d435_top_camera,wrist_camera"
                 )
-            features[f"observation.images.{camera_name}"] = {
-                "dtype": "image",
-                "shape": camera_shapes[camera_name],
-                "names": ["height", "width", "channels"],
-            }
-
-        has_dataset_info = os.path.exists(os.path.join(dataset_root, "meta", "info.json"))
-        has_episode_tables = False
-        if has_dataset_info:
-            for root, _dirs, files in os.walk(os.path.join(dataset_root, "data")):
-                if any(name.endswith(".parquet") for name in files):
-                    has_episode_tables = True
-                    break
-            if not has_episode_tables:
-                print(f"[WARN] Recreating empty LeRobot dataset root: {dataset_root}")
-                shutil.rmtree(dataset_root)
-                has_dataset_info = False
-
-        if has_dataset_info:
-            self.dataset = LeRobotDataset(self.repo_id, root=dataset_root)
-            self.dataset.episode_buffer = self.dataset.create_episode_buffer()
-            if self.image_writer_processes or self.image_writer_threads:
-                self.dataset.start_image_writer(
-                    num_processes=self.image_writer_processes,
-                    num_threads=self.image_writer_threads,
-                )
-            print(f"[INFO] Loaded existing LeRobot dataset: {dataset_root}")
-        else:
-            if os.path.isdir(dataset_root):
-                if os.listdir(dataset_root):
-                    raise RuntimeError(
-                        f"Record root exists but is not a LeRobot dataset: {dataset_root}. "
-                        "Use a different --repo-id/--record-dir or move the existing directory."
-                    )
-                os.rmdir(dataset_root)
-            self.dataset = LeRobotDataset.create(
-                repo_id=self.repo_id,
-                fps=self.record_fps,
-                features=features,
-                root=dataset_root,
-                robot_type="piper",
-                use_videos=False,
-                image_writer_processes=self.image_writer_processes,
-                image_writer_threads=self.image_writer_threads,
-            )
-            print(f"[INFO] Created LeRobot dataset: {dataset_root}")
+        print(f"[INFO] Raw recording root: {self.raw_dataset_root}")
         if self.image_writer_processes or self.image_writer_threads:
             print(
-                "[INFO] LeRobot async image writer enabled: "
-                f"processes={self.image_writer_processes}, threads={self.image_writer_threads}"
+                "[WARN] --image-writer-processes/--image-writer-threads are ignored "
+                "for raw recording. Use convert_raw_to_lerobot.py for LeRobot output."
             )
 
     def _begin_recording_episode(self):
+        episode_index = self._next_raw_episode_index()
+        episode_dir = os.path.join(
+            self.raw_dataset_root, "episodes", f"episode_{episode_index:06d}"
+        )
+        if os.path.isdir(episode_dir):
+            shutil.rmtree(episode_dir)
+        for camera_name in self.record_cameras:
+            os.makedirs(os.path.join(episode_dir, "images", camera_name), exist_ok=True)
         with self.record_lock:
             self.record_state = "recording"
             self.pending_stop_episode = False
@@ -799,8 +752,12 @@ class ServoTeleoperatorSim:
             self.last_record_time = 0.0
             self.last_recorded_state = None
             self.current_episode_frames = 0
+            self.current_episode_frames_data = []
+            self.current_episode_camera_shapes = {}
+            self.current_episode_index = episode_index
+            self.current_episode_dir = episode_dir
+            self.current_episode_started_at = time.time()
             self.countdown_end_time = None
-            episode_index = self._current_dataset_episode_index()
             self.status_message = f"RECORDING episode {episode_index}"
         print(
             f"[RECORD] Recording episode {episode_index}. "
@@ -808,9 +765,26 @@ class ServoTeleoperatorSim:
         )
 
     def _current_dataset_episode_index(self):
-        if self.dataset is None:
-            return 0
-        return int(getattr(self.dataset.meta, "total_episodes", 0))
+        return int(self.current_episode_index)
+
+    def _next_raw_episode_index(self):
+        episodes_dir = os.path.join(self.raw_dataset_root, "episodes")
+        max_index = -1
+        if os.path.isdir(episodes_dir):
+            for name in os.listdir(episodes_dir):
+                if not name.startswith("episode_"):
+                    continue
+                try:
+                    max_index = max(max_index, int(name.split("_")[-1]))
+                except ValueError:
+                    continue
+        return max_index + 1
+
+    def _expected_record_camera_shapes(self):
+        return {
+            "d435_top_camera": (480, 640, 3),
+            "wrist_camera": (self.wrist_camera_height, self.wrist_camera_width, 3),
+        }
 
     def _request_stop_episode(self):
         with self.record_lock:
@@ -853,38 +827,48 @@ class ServoTeleoperatorSim:
         )
 
     def _save_current_episode(self):
-        if self.dataset is None or self.current_episode_frames == 0:
+        if self.current_episode_dir is None or self.current_episode_frames == 0:
             print("[RECORD] No frames recorded; skipping save.")
             self._clear_current_episode_buffer()
             return
         episode_index = self._current_dataset_episode_index()
         print(f"[RECORD] Saving episode {episode_index} ({self.current_episode_frames} frames)...")
-        self.dataset.save_episode()
-        print(f"[RECORD] Saved episode {episode_index}.")
+        meta = {
+            "format": "uarm_sim_raw_v1",
+            "episode_index": episode_index,
+            "robot_type": self.robot_uids,
+            "task": self.task,
+            "fps": self.record_fps,
+            "record_cameras": list(self.record_cameras),
+            "joint_names": ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6", "gripper"],
+            "state_key": "observation_state",
+            "teleop_target_key": "teleop_target",
+            "teleop_target_semantics": "mapped_robot_absolute_target",
+            "action_conversion": "lerobot_delta_action = observation_state[t] - observation_state[t-1]",
+            "num_frames": self.current_episode_frames,
+            "camera_shapes": self.current_episode_camera_shapes,
+            "started_at_unix": self.current_episode_started_at,
+            "saved_at_unix": time.time(),
+        }
+        with open(os.path.join(self.current_episode_dir, "meta.json"), "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2, sort_keys=True)
+        frames_path = os.path.join(self.current_episode_dir, "frames.jsonl")
+        with open(frames_path, "w", encoding="utf-8") as f:
+            for frame in self.current_episode_frames_data:
+                f.write(json.dumps(frame, sort_keys=True) + "\n")
+        print(f"[RECORD] Saved raw episode {episode_index}: {self.current_episode_dir}")
+        self._reset_current_episode_buffer()
 
     def _clear_current_episode_buffer(self):
-        if self.dataset is None or getattr(self.dataset, "episode_buffer", None) is None:
-            return
-        wait_image_writer = getattr(self.dataset, "_wait_image_writer", None)
-        if callable(wait_image_writer):
-            wait_image_writer()
-        episode_index = self.dataset.episode_buffer.get("episode_index")
-        if episode_index is not None:
-            for camera_key in getattr(self.dataset.meta, "camera_keys", []):
-                try:
-                    img_dir = self.dataset._get_image_file_path(
-                        episode_index=episode_index,
-                        image_key=camera_key,
-                        frame_index=0,
-                    ).parent
-                except Exception:
-                    continue
-                if img_dir.is_dir():
-                    shutil.rmtree(img_dir)
-        if hasattr(self.dataset, "clear_episode_buffer"):
-            self.dataset.clear_episode_buffer()
-        else:
-            self.dataset.episode_buffer = self.dataset.create_episode_buffer()
+        if self.current_episode_dir and os.path.isdir(self.current_episode_dir):
+            shutil.rmtree(self.current_episode_dir)
+        self._reset_current_episode_buffer()
+
+    def _reset_current_episode_buffer(self):
+        self.current_episode_dir = None
+        self.current_episode_frames_data = []
+        self.current_episode_camera_shapes = {}
+        self.current_episode_started_at = None
 
     def _discard_current_episode(self):
         episode_index = self._current_dataset_episode_index()
@@ -1028,18 +1012,34 @@ class ServoTeleoperatorSim:
             camera_frames = self._collect_record_camera_frames()
         if state is None or camera_frames is None:
             return
-        if self.last_recorded_state is None:
-            action = np.zeros(7, dtype=np.float32)
-        else:
-            action = (state - self.last_recorded_state).astype(np.float32)
-        frame = {
-            "observation.state": state.astype(np.float32),
-            "action": action,
-        }
-        frame.update(camera_frames)
+        with self.record_lock:
+            teleop_target = None if self.latest_teleop_target is None else self.latest_teleop_target.copy()
+            episode_dir = self.current_episode_dir
+        if teleop_target is None or episode_dir is None:
+            return
+
+        frame_index = self.current_episode_frames
         timestamp = self.current_episode_frames / float(self.record_fps)
-        with NullTimer(self.timing, "record.add_frame"):
-            self.dataset.add_frame(frame, task=self.task, timestamp=timestamp)
+        image_paths = {}
+        with NullTimer(self.timing, "record.write_frame"):
+            for camera_key, frame in camera_frames.items():
+                camera_name = camera_key.split(".")[-1]
+                rel_path = os.path.join("images", camera_name, f"frame_{frame_index:06d}.png")
+                abs_path = os.path.join(episode_dir, rel_path)
+                bgr_frame = self.cv2.cvtColor(frame, self.cv2.COLOR_RGB2BGR)
+                if not self.cv2.imwrite(abs_path, bgr_frame):
+                    raise RuntimeError(f"Failed to write raw camera frame: {abs_path}")
+                image_paths[camera_name] = rel_path
+                self.current_episode_camera_shapes[camera_name] = list(frame.shape)
+            self.current_episode_frames_data.append(
+                {
+                    "frame_index": frame_index,
+                    "timestamp": timestamp,
+                    "observation_state": state.astype(np.float32).tolist(),
+                    "teleop_target": teleop_target.astype(np.float32).tolist(),
+                    "images": image_paths,
+                }
+            )
         self.last_recorded_state = state.copy()
         self.last_record_time = now
         self.current_episode_frames += 1
@@ -1271,6 +1271,8 @@ class ServoTeleoperatorSim:
             if pose is not None:
                 try:
                     action = self.convert_pose_to_action(pose)
+                    with self.record_lock:
+                        self.latest_teleop_target = np.asarray(action, dtype=np.float32).copy()
                     on_pose(action)
                 except Exception as e:
                     print(f"Simulation control callback error: {e}")
@@ -1335,13 +1337,6 @@ class ServoTeleoperatorSim:
             if self.command_thread is not None:
                 self.command_thread.join(timeout=0.2)
             print("All threads stopped")
-            if self.record_enabled and self.dataset is not None:
-                finalize = getattr(self.dataset, "finalize", None)
-                if callable(finalize):
-                    finalize()
-                stop_image_writer = getattr(self.dataset, "stop_image_writer", None)
-                if callable(stop_image_writer):
-                    stop_image_writer()
             self.env.close()
             self.ser.close()
             if self.cv2 is not None:
@@ -1480,7 +1475,7 @@ if __name__ == "__main__":
     parser.add_argument(
         '--record',
         action='store_true',
-        help='Record local LeRobot-format episodes from the simulation'
+        help='Record raw simulation episodes for later LeRobot conversion'
     )
     parser.add_argument(
         '--record-dir',
@@ -1492,7 +1487,7 @@ if __name__ == "__main__":
         '--repo-id',
         type=str,
         default='local/teleop_sim',
-        help='LeRobot dataset repo id; used as a subdirectory under --record-dir'
+        help='Raw dataset id; used as a subdirectory under --record-dir'
     )
     parser.add_argument(
         '--task',
@@ -1516,13 +1511,13 @@ if __name__ == "__main__":
         '--image-writer-processes',
         type=int,
         default=0,
-        help='Async LeRobot image writer process count; 0 disables processes'
+        help='Deprecated for raw recording; ignored by --record'
     )
     parser.add_argument(
         '--image-writer-threads',
         type=int,
         default=4,
-        help='Async LeRobot image writer thread count; 0 disables threads'
+        help='Deprecated for raw recording; ignored by --record'
     )
     parser.add_argument(
         '--debug-timing',
@@ -1586,7 +1581,7 @@ if __name__ == "__main__":
         print(f"Task:             put red box to blue plate")
         print(f"Record cameras:   {record_cameras}")
         print(f"Record FPS:       {args.record_fps}")
-        print(f"Image writer:     {args.image_writer_processes} processes, {args.image_writer_threads} threads")
+        print("Record format:    raw uarm_sim_raw_v1")
     print("-" * 60)
     
     # Create and run simulation instance

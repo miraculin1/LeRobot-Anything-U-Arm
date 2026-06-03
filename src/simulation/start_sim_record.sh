@@ -14,7 +14,7 @@ python src/simulation/teleop_sim.py \
     --no-render-preflight \
     --debug-timing \
     --record \
-    --record-dir ./lerobot_data/eazy_sim_data \
+    --record-dir ./raw_data/eazy_sim_data \
     --repo-id local/teleop_sim \
     --task "put red box to blue plate" \
     --record-cameras d435_top_camera,wrist_camera \
