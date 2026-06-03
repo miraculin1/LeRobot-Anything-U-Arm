@@ -924,7 +924,6 @@ class ServoTeleoperatorSim:
             "state_key": "observation_state",
             "teleop_target_key": "teleop_target",
             "teleop_target_semantics": "mapped_robot_absolute_target",
-            "action_conversion": "lerobot_delta_action = observation_state[t] - observation_state[t-1]",
             "num_frames": self.current_episode_frames,
             "camera_shapes": self.current_episode_camera_shapes,
             "started_at_unix": self.current_episode_started_at,
