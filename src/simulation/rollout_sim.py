@@ -11,7 +11,9 @@ from threading import Event, Lock, Thread
 import gymnasium as gym
 import mani_skill.envs  # Must import to register all env/agent
 import numpy as np
+import sapien
 from transforms3d.euler import euler2quat
+from mani_skill.utils.building import actors
 
 try:
     from teleop_sim import (
@@ -167,6 +169,9 @@ class ZeroActionRolloutSim(ServoTeleoperatorSim):
         self.object_size = object_size
         self.spawn_object = spawn_object
         self.grasp_object = None
+        self.gray_box = None
+        self.black_box = None
+        self.distractor_boxes = []
         self.render_mode = render_mode
         self.wrist_camera_width = wrist_camera_width
         self.wrist_camera_height = wrist_camera_height
@@ -325,6 +330,7 @@ class ZeroActionRolloutSim(ServoTeleoperatorSim):
         )
         if self.spawn_object:
             self._spawn_grasp_object()
+            self._spawn_distractor_boxes()
             self._spawn_plates()
             if self.show_random_workspace:
                 self._spawn_random_workspace_visual()
@@ -337,6 +343,107 @@ class ZeroActionRolloutSim(ServoTeleoperatorSim):
         if self.record_enabled:
             self._setup_lerobot_dataset()
             self._begin_recording_episode()
+
+    def _spawn_distractor_box(self, name: str, color, y_offset: float):
+        """Spawn a rollout-only dynamic cube as a distractor object."""
+        half_size = self.object_size / 2.0
+        box = actors.build_cube(
+            self.env.unwrapped.scene,
+            half_size=half_size,
+            color=color,
+            name=name,
+            body_type="dynamic",
+            initial_pose=sapien.Pose(
+                p=[self.object_pos[0], self.object_pos[1] + y_offset, self.object_pos[2]]
+            ),
+        )
+        print(
+            f"[INFO] Spawned rollout distractor box '{name}' "
+            f"with size {self.object_size} m"
+        )
+        return box
+
+    def _spawn_distractor_boxes(self):
+        self.gray_box = self._spawn_distractor_box(
+            "gray_box",
+            [0.45, 0.45, 0.45, 1.0],
+            0.12,
+        )
+        self.black_box = self._spawn_distractor_box(
+            "black_box",
+            [0.02, 0.02, 0.02, 1.0],
+            -0.12,
+        )
+        self.distractor_boxes = [
+            ("gray box", self.gray_box),
+            ("black box", self.black_box),
+        ]
+
+    def _randomize_task_objects(self):
+        if not self.spawn_object or self.grasp_object is None:
+            return
+        rng = np.random.default_rng()
+        distractor_boxes = [
+            (label, box) for label, box in self.distractor_boxes if box is not None
+        ]
+        if self.randomize_all_task_objects:
+            sampled_points = self._sample_non_overlapping_xy(
+                1 + len(distractor_boxes) + len(self.plates)
+            )
+            red_box_xy = sampled_points[0]
+            offset = 1
+            distractor_points = sampled_points[offset:offset + len(distractor_boxes)]
+            offset += len(distractor_boxes)
+            plate_points = sampled_points[offset:]
+        else:
+            red_box_xy = self.fixed_red_box_xy
+            fixed_points = [self.fixed_red_box_xy, self.fixed_blue_plate_xy]
+            sampled_points = self._sample_non_overlapping_xy(
+                len(distractor_boxes) + max(0, len(self.plates) - 1),
+                existing_points=fixed_points,
+            )
+            distractor_points = sampled_points[:len(distractor_boxes)]
+            random_plate_points = sampled_points[len(distractor_boxes):]
+            plate_points = [self.fixed_blue_plate_xy] + random_plate_points
+
+        object_yaw = float(rng.uniform(0.0, 2.0 * np.pi)) if self.randomize_object_yaw else 0.0
+        cube_pose = sapien.Pose(
+            p=[red_box_xy[0], red_box_xy[1], self.object_pos[2]],
+            q=euler2quat(0, 0, object_yaw),
+        )
+        self.grasp_object.set_pose(cube_pose)
+        self._zero_actor_velocity(self.grasp_object)
+
+        distractor_summaries = []
+        for (label, box), point in zip(distractor_boxes, distractor_points):
+            yaw = float(rng.uniform(0.0, 2.0 * np.pi)) if self.randomize_object_yaw else 0.0
+            pose = sapien.Pose(
+                p=[point[0], point[1], self.object_pos[2]],
+                q=euler2quat(0, 0, yaw),
+            )
+            box.set_pose(pose)
+            self._zero_actor_velocity(box)
+            distractor_summaries.append(
+                f"{label} xy={point.round(3).tolist()}, {label} yaw={yaw:.3f} rad"
+            )
+
+        table_z = self.object_pos[2] - self.object_size / 2.0
+        plate_z = table_z + self.plate_half_height
+        for plate, point in zip(self.plates, plate_points):
+            plate.set_pose(sapien.Pose(p=[point[0], point[1], plate_z], q=self.plate_quat))
+            self._zero_actor_velocity(plate)
+
+        distractor_summary = (
+            ", " + ", ".join(distractor_summaries) if distractor_summaries else ""
+        )
+        print(
+            "[INFO] Randomized rollout task objects: "
+            f"red box xy={red_box_xy.round(3).tolist()}, "
+            f"red box yaw={object_yaw:.3f} rad"
+            f"{distractor_summary}, "
+            f"plate xys={[point.round(3).tolist() for point in plate_points]}, "
+            f"all_random={self.randomize_all_task_objects}"
+        )
 
     def zero_policy_action(self) -> np.ndarray:
         return np.zeros(7, dtype=np.float32)
