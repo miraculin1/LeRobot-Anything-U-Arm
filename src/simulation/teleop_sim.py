@@ -158,7 +158,9 @@ class ServoTeleoperatorSim:
                  control_dwell: float = 0.0,
                  debug_timing: bool = False,
                  debug_interval: int = 30,
-                 debug_warmup: int = 5):
+                 debug_warmup: int = 5,
+                 randomize_all_task_objects: bool = False,
+                 randomize_object_yaw: bool = False):
         """Initialize teleoperation system
         
         Args:
@@ -282,6 +284,8 @@ class ServoTeleoperatorSim:
         self.min_object_spacing = 0.10
         self.fixed_red_box_xy = np.array([0.457, -1.612], dtype=np.float64)
         self.fixed_blue_plate_xy = np.array([0.577, -1.612], dtype=np.float64)
+        self.randomize_all_task_objects = bool(randomize_all_task_objects)
+        self.randomize_object_yaw = bool(randomize_object_yaw)
         
         # Initialize servos and calibrate zero position
         self._init_servos()
@@ -467,26 +471,38 @@ class ServoTeleoperatorSim:
     def _randomize_task_objects(self):
         if not self.spawn_object or self.grasp_object is None:
             return
+        rng = np.random.default_rng()
+        if self.randomize_all_task_objects:
+            sampled_points = self._sample_non_overlapping_xy(1 + len(self.plates))
+            red_box_xy = sampled_points[0]
+            plate_points = sampled_points[1:]
+            random_plate_points = plate_points
+        else:
+            red_box_xy = self.fixed_red_box_xy
+            fixed_points = [self.fixed_red_box_xy, self.fixed_blue_plate_xy]
+            random_plate_points = self._sample_non_overlapping_xy(
+                max(0, len(self.plates) - 1),
+                existing_points=fixed_points,
+            )
+            plate_points = [self.fixed_blue_plate_xy] + random_plate_points
+        object_yaw = float(rng.uniform(0.0, 2.0 * np.pi)) if self.randomize_object_yaw else 0.0
         cube_pose = sapien.Pose(
-            p=[self.fixed_red_box_xy[0], self.fixed_red_box_xy[1], self.object_pos[2]]
+            p=[red_box_xy[0], red_box_xy[1], self.object_pos[2]],
+            q=euler2quat(0, 0, object_yaw),
         )
         self.grasp_object.set_pose(cube_pose)
+        self._zero_actor_velocity(self.grasp_object)
         table_z = self.object_pos[2] - self.object_size / 2.0
         plate_z = table_z + self.plate_half_height
-        fixed_points = [self.fixed_red_box_xy, self.fixed_blue_plate_xy]
-        random_points = self._sample_non_overlapping_xy(
-            max(0, len(self.plates) - 1),
-            existing_points=fixed_points,
-        )
-        plate_points = [self.fixed_blue_plate_xy] + random_points
         for plate, point in zip(self.plates, plate_points):
             plate.set_pose(sapien.Pose(p=[point[0], point[1], plate_z], q=self.plate_quat))
             self._zero_actor_velocity(plate)
         print(
             "[INFO] Randomized task objects: "
-            f"red box xy={self.fixed_red_box_xy.round(3).tolist()}, "
-            f"blue plate xy={self.fixed_blue_plate_xy.round(3).tolist()}, "
-            f"random plate xys={[point.round(3).tolist() for point in random_points]}"
+            f"red box xy={red_box_xy.round(3).tolist()}, "
+            f"red box yaw={object_yaw:.3f} rad, "
+            f"plate xys={[point.round(3).tolist() for point in plate_points]}, "
+            f"all_random={self.randomize_all_task_objects}"
         )
 
     def _zero_actor_velocity(self, actor):
@@ -1660,6 +1676,16 @@ if __name__ == "__main__":
         help='Disable spawning the grasp object'
     )
     parser.add_argument(
+        '--randomize-all-task-objects',
+        action='store_true',
+        help='Randomize the red box and all colored plates within the task workspace'
+    )
+    parser.add_argument(
+        '--randomize-object-yaw',
+        action='store_true',
+        help='Randomize the red box yaw angle on each task reset'
+    )
+    parser.add_argument(
         '--record',
         action='store_true',
         help='Record raw simulation episodes for later LeRobot conversion'
@@ -1764,6 +1790,8 @@ if __name__ == "__main__":
     else:
         print(f"Grasp object pos: {args.object_pos}")
         print(f"Grasp object size: {args.object_size} m")
+        print(f"Randomize all task objects: {'enabled' if args.randomize_all_task_objects else 'disabled'}")
+        print(f"Randomize object yaw: {'enabled' if args.randomize_object_yaw else 'disabled'}")
     record_cameras = tuple(
         camera.strip() for camera in args.record_cameras.split(",") if camera.strip()
     )
@@ -1812,6 +1840,8 @@ if __name__ == "__main__":
             debug_timing=args.debug_timing,
             debug_interval=args.debug_interval,
             debug_warmup=args.debug_warmup,
+            randomize_all_task_objects=args.randomize_all_task_objects,
+            randomize_object_yaw=args.randomize_object_yaw,
         )
         sim.rate = args.rate
         sim.timing.target_period = max(1.0 / sim.rate, 1e-6)

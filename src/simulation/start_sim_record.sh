@@ -12,8 +12,10 @@ python src/simulation/teleop_sim.py \
     --no-env-render \
     --control-dwell 0.0 \
     --no-render-preflight \
+    --randomize-all-task-objects \
+    --randomize-object-yaw \
     --record \
-    --record-dir ./raw_data/eazy_sim_data \
+    --record-dir ./raw_data/hard_sim_data \
     --repo-id local/teleop_sim \
     --task "put red box to blue plate" \
     --record-cameras d435_top_camera,wrist_camera \

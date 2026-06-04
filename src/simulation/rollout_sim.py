@@ -150,6 +150,8 @@ class ZeroActionRolloutSim(ServoTeleoperatorSim):
         gripper_plot_update_rate: float = 5.0,
         gripper_contact_force_threshold: float = 1e-3,
         debug_action_interval: int = 30,
+        randomize_all_task_objects: bool = False,
+        randomize_object_yaw: bool = False,
     ):
         self.SERIAL_PORT = None
         self.BAUDRATE = None
@@ -249,6 +251,8 @@ class ZeroActionRolloutSim(ServoTeleoperatorSim):
         self.min_object_spacing = 0.10
         self.fixed_red_box_xy = np.array([0.457, -1.612], dtype=np.float64)
         self.fixed_blue_plate_xy = np.array([0.577, -1.612], dtype=np.float64)
+        self.randomize_all_task_objects = bool(randomize_all_task_objects)
+        self.randomize_object_yaw = bool(randomize_object_yaw)
         self.initial_state = self._validate_initial_state(initial_state)
         self.initial_env_action = self.piper_state_to_env_action(self.initial_state)
 
@@ -910,6 +914,16 @@ def parse_args():
     parser.add_argument("--object-size", type=float, default=0.04)
     parser.add_argument("--no-object", action="store_true")
     parser.add_argument(
+        "--randomize-all-task-objects",
+        action="store_true",
+        help="Randomize the red box and all colored plates within the task workspace",
+    )
+    parser.add_argument(
+        "--randomize-object-yaw",
+        action="store_true",
+        help="Randomize the red box yaw angle on each task reset",
+    )
+    parser.add_argument(
         "--initial-state",
         type=float,
         nargs=7,
@@ -1025,6 +1039,8 @@ def main():
     else:
         print(f"Grasp object pos: {args.object_pos}")
         print(f"Grasp object size: {args.object_size} m")
+        print(f"Randomize all task objects: {'enabled' if args.randomize_all_task_objects else 'disabled'}")
+        print(f"Randomize object yaw: {'enabled' if args.randomize_object_yaw else 'disabled'}")
     print(f"Initial state: {np.asarray(args.initial_state, dtype=np.float32).tolist()}")
     print(f"Debug timing: {'enabled' if args.debug_timing else 'disabled'}")
     print(f"Debug action interval: {args.debug_action_interval}")
@@ -1073,6 +1089,8 @@ def main():
         gripper_plot_update_rate=args.gripper_plot_update_rate,
         gripper_contact_force_threshold=args.gripper_contact_force_threshold,
         debug_action_interval=args.debug_action_interval,
+        randomize_all_task_objects=args.randomize_all_task_objects,
+        randomize_object_yaw=args.randomize_object_yaw,
     )
 
     if not wait_for_human_start(sim, args.wait_for_start, args.policy_mode):

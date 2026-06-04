@@ -17,5 +17,7 @@ python src/simulation/rollout_sim.py \
     --render-mode sensors \
     --no-env-render \
     --no-render-preflight \
+    --randomize-all-task-objects \
+    --randomize-object-yaw \
     --no-show-gripper-plot \
     --no-record
