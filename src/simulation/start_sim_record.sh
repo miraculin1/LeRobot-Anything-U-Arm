@@ -14,6 +14,8 @@ python src/simulation/teleop_sim.py \
     --no-render-preflight \
     --randomize-all-task-objects \
     --randomize-object-yaw \
+    --random-workspace-inner-diameter 0.60 \
+    --random-workspace-outer-diameter 1.20 \
     --record \
     --record-dir ./raw_data/hard_sim_data \
     --repo-id local/teleop_sim \

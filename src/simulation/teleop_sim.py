@@ -160,7 +160,10 @@ class ServoTeleoperatorSim:
                  debug_interval: int = 30,
                  debug_warmup: int = 5,
                  randomize_all_task_objects: bool = False,
-                 randomize_object_yaw: bool = False):
+                 randomize_object_yaw: bool = False,
+                 show_random_workspace: bool = False,
+                 random_workspace_inner_diameter: float = 0.60,
+                 random_workspace_outer_diameter: float = 1.00):
         """Initialize teleoperation system
         
         Args:
@@ -280,12 +283,25 @@ class ServoTeleoperatorSim:
         self.plate_radius = 0.045
         self.plate_half_height = 0.004
         self.plate_quat = euler2quat(0, np.pi / 2, 0)
-        self.random_workspace = dict(x=(0.395, 0.673), y=(-1.959, -0.991))
+        self.random_workspace = dict(x=(0.195, 0.773), y=(-2.059, -0.891))
         self.min_object_spacing = 0.10
         self.fixed_red_box_xy = np.array([0.457, -1.612], dtype=np.float64)
         self.fixed_blue_plate_xy = np.array([0.577, -1.612], dtype=np.float64)
         self.randomize_all_task_objects = bool(randomize_all_task_objects)
         self.randomize_object_yaw = bool(randomize_object_yaw)
+        self.show_random_workspace = bool(show_random_workspace)
+        self.random_workspace_visual = None
+        self.random_workspace_ring_center = None
+        self.random_workspace_inner_radius = float(random_workspace_inner_diameter) / 2.0
+        self.random_workspace_outer_radius = float(random_workspace_outer_diameter) / 2.0
+        if (
+            self.random_workspace_inner_radius < 0.0
+            or self.random_workspace_outer_radius <= self.random_workspace_inner_radius
+        ):
+            raise ValueError(
+                "Expected 0 <= --random-workspace-inner-diameter "
+                "< --random-workspace-outer-diameter"
+            )
         
         # Initialize servos and calibrate zero position
         self._init_servos()
@@ -338,9 +354,18 @@ class ServoTeleoperatorSim:
             raise
         obs, _ = self.env.reset(seed=0)
         print("Action space:", self.env.action_space)
+        self.random_workspace_ring_center = self._robot_base_xy()
+        print(
+            "[INFO] Random workspace ring: "
+            f"center={self.random_workspace_ring_center.round(3).tolist()}, "
+            f"inner_radius={self.random_workspace_inner_radius:.3f}, "
+            f"outer_radius={self.random_workspace_outer_radius:.3f}"
+        )
         if self.spawn_object:
             self._spawn_grasp_object()
             self._spawn_plates()
+            if self.show_random_workspace:
+                self._spawn_random_workspace_visual()
             self._randomize_task_objects()
         
         # Set initial standing pose for H1
@@ -444,6 +469,72 @@ class ServoTeleoperatorSim:
             self.plates.append(plate)
         print(f"[INFO] Spawned {len(self.plates)} colored plates: blue, green, yellow")
 
+    def _spawn_random_workspace_visual(self):
+        """Add a non-colliding red layer over the table/ring randomization workspace."""
+        xs = self.random_workspace["x"]
+        ys = self.random_workspace["y"]
+        tile_size = 0.025
+        tile_half_height = 0.0005
+        table_z = self.object_pos[2] - self.object_size / 2.0
+        builder = self.env.unwrapped.scene.create_actor_builder()
+        material = sapien.render.RenderMaterial(base_color=[1.0, 0.0, 0.0, 0.25])
+        tile_count = 0
+        x_centers = np.arange(xs[0] + tile_size / 2.0, xs[1], tile_size)
+        y_centers = np.arange(ys[0] + tile_size / 2.0, ys[1], tile_size)
+        for x in x_centers:
+            for y in y_centers:
+                if not self._xy_in_random_workspace_ring([x, y]):
+                    continue
+                builder.add_box_visual(
+                    half_size=[tile_size / 2.0, tile_size / 2.0, tile_half_height],
+                    pose=sapien.Pose(p=[x, y, table_z + tile_half_height]),
+                    material=material,
+                )
+                tile_count += 1
+        if tile_count == 0:
+            raise RuntimeError(
+                "Random workspace table/ring intersection is empty. "
+                "Adjust --random-workspace-inner-diameter or "
+                "--random-workspace-outer-diameter."
+            )
+        self.random_workspace_visual = builder.build_static(name="random_workspace_red_visual")
+        print(
+            "[INFO] Spawned red random workspace visual: "
+            f"x={xs}, y={ys}, ring_center={self.random_workspace_ring_center.round(3).tolist()}, "
+            f"inner_radius={self.random_workspace_inner_radius:.3f}, "
+            f"outer_radius={self.random_workspace_outer_radius:.3f}, tiles={tile_count}"
+        )
+
+    def _robot_base_xy(self) -> np.ndarray:
+        agent = getattr(self.env.unwrapped, "agent", None)
+        if agent is None:
+            raise RuntimeError("Cannot define ring workspace: env has no agent")
+        robot = getattr(agent, "robot", None)
+        if robot is None:
+            raise RuntimeError("Cannot define ring workspace: agent has no robot")
+        get_pose = getattr(robot, "get_pose", None)
+        pose = get_pose() if callable(get_pose) else getattr(robot, "pose", None)
+        if pose is None:
+            raise RuntimeError("Cannot define ring workspace: robot pose is unavailable")
+        pos = getattr(pose, "p", pose)
+        if hasattr(pos, "detach"):
+            pos = pos.detach().cpu().numpy()
+        pos = np.asarray(pos, dtype=np.float64).reshape(-1)
+        if pos.size < 2:
+            raise RuntimeError(f"Cannot define ring workspace from robot pose: {pos}")
+        return pos[:2].copy()
+
+    def _xy_in_random_workspace_ring(self, xy) -> bool:
+        if self.random_workspace_ring_center is None:
+            raise RuntimeError("Random workspace ring center has not been initialized")
+        xy = np.asarray(xy, dtype=np.float64).reshape(2)
+        distance = float(np.linalg.norm(xy - self.random_workspace_ring_center))
+        return (
+            self.random_workspace_inner_radius
+            <= distance
+            <= self.random_workspace_outer_radius
+        )
+
     def _sample_non_overlapping_xy(self, count: int, existing_points=None):
         rng = np.random.default_rng()
         xs = self.random_workspace["x"]
@@ -451,7 +542,7 @@ class ServoTeleoperatorSim:
         points = [np.asarray(point, dtype=np.float64) for point in (existing_points or [])]
         sampled_points = []
         for _ in range(count):
-            for _attempt in range(200):
+            for _attempt in range(1000):
                 point = np.array(
                     [
                         rng.uniform(xs[0], xs[1]),
@@ -459,13 +550,17 @@ class ServoTeleoperatorSim:
                     ],
                     dtype=np.float64,
                 )
+                if not self._xy_in_random_workspace_ring(point):
+                    continue
                 if all(np.linalg.norm(point - prev) >= self.min_object_spacing for prev in points):
                     points.append(point)
                     sampled_points.append(point)
                     break
             else:
-                points.append(point)
-                sampled_points.append(point)
+                raise RuntimeError(
+                    "Failed to sample non-overlapping points in the table/ring "
+                    "random workspace. Adjust ring diameters or min spacing."
+                )
         return sampled_points
 
     def _randomize_task_objects(self):
@@ -1686,6 +1781,23 @@ if __name__ == "__main__":
         help='Randomize the red box yaw angle on each task reset'
     )
     parser.add_argument(
+        '--show-random-workspace',
+        action='store_true',
+        help='Show a red non-colliding visual layer over the task randomization workspace'
+    )
+    parser.add_argument(
+        '--random-workspace-inner-diameter',
+        type=float,
+        default=0.60,
+        help='Inner diameter in meters of the robot-base-centered random workspace ring'
+    )
+    parser.add_argument(
+        '--random-workspace-outer-diameter',
+        type=float,
+        default=1.60,
+        help='Outer diameter in meters of the robot-base-centered random workspace ring'
+    )
+    parser.add_argument(
         '--record',
         action='store_true',
         help='Record raw simulation episodes for later LeRobot conversion'
@@ -1792,6 +1904,12 @@ if __name__ == "__main__":
         print(f"Grasp object size: {args.object_size} m")
         print(f"Randomize all task objects: {'enabled' if args.randomize_all_task_objects else 'disabled'}")
         print(f"Randomize object yaw: {'enabled' if args.randomize_object_yaw else 'disabled'}")
+        print(f"Random workspace visual: {'enabled' if args.show_random_workspace else 'disabled'}")
+        print(
+            "Random workspace ring diameters: "
+            f"inner={args.random_workspace_inner_diameter} m, "
+            f"outer={args.random_workspace_outer_diameter} m"
+        )
     record_cameras = tuple(
         camera.strip() for camera in args.record_cameras.split(",") if camera.strip()
     )
@@ -1842,6 +1960,9 @@ if __name__ == "__main__":
             debug_warmup=args.debug_warmup,
             randomize_all_task_objects=args.randomize_all_task_objects,
             randomize_object_yaw=args.randomize_object_yaw,
+            show_random_workspace=args.show_random_workspace,
+            random_workspace_inner_diameter=args.random_workspace_inner_diameter,
+            random_workspace_outer_diameter=args.random_workspace_outer_diameter,
         )
         sim.rate = args.rate
         sim.timing.target_period = max(1.0 / sim.rate, 1e-6)

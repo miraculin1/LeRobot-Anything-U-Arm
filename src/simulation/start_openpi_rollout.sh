@@ -19,5 +19,7 @@ python src/simulation/rollout_sim.py \
     --no-render-preflight \
     --randomize-all-task-objects \
     --randomize-object-yaw \
+    --random-workspace-inner-diameter 0.60 \
+    --random-workspace-outer-diameter 1.20 \
     --no-show-gripper-plot \
     --no-record

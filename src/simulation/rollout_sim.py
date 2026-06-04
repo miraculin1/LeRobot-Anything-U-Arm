@@ -152,6 +152,9 @@ class ZeroActionRolloutSim(ServoTeleoperatorSim):
         debug_action_interval: int = 30,
         randomize_all_task_objects: bool = False,
         randomize_object_yaw: bool = False,
+        show_random_workspace: bool = False,
+        random_workspace_inner_diameter: float = 0.60,
+        random_workspace_outer_diameter: float = 1.20,
     ):
         self.SERIAL_PORT = None
         self.BAUDRATE = None
@@ -247,12 +250,25 @@ class ZeroActionRolloutSim(ServoTeleoperatorSim):
         self.plate_radius = 0.045
         self.plate_half_height = 0.004
         self.plate_quat = euler2quat(0, np.pi / 2, 0)
-        self.random_workspace = dict(x=(0.395, 0.673), y=(-1.959, -0.991))
+        self.random_workspace = dict(x=(0.195, 0.773), y=(-2.059, -0.891))
         self.min_object_spacing = 0.10
         self.fixed_red_box_xy = np.array([0.457, -1.612], dtype=np.float64)
         self.fixed_blue_plate_xy = np.array([0.577, -1.612], dtype=np.float64)
         self.randomize_all_task_objects = bool(randomize_all_task_objects)
         self.randomize_object_yaw = bool(randomize_object_yaw)
+        self.show_random_workspace = bool(show_random_workspace)
+        self.random_workspace_visual = None
+        self.random_workspace_ring_center = None
+        self.random_workspace_inner_radius = float(random_workspace_inner_diameter) / 2.0
+        self.random_workspace_outer_radius = float(random_workspace_outer_diameter) / 2.0
+        if (
+            self.random_workspace_inner_radius < 0.0
+            or self.random_workspace_outer_radius <= self.random_workspace_inner_radius
+        ):
+            raise ValueError(
+                "Expected 0 <= --random-workspace-inner-diameter "
+                "< --random-workspace-outer-diameter"
+            )
         self.initial_state = self._validate_initial_state(initial_state)
         self.initial_env_action = self.piper_state_to_env_action(self.initial_state)
 
@@ -300,9 +316,18 @@ class ZeroActionRolloutSim(ServoTeleoperatorSim):
 
         self.env.reset(seed=0)
         print("Action space:", self.env.action_space)
+        self.random_workspace_ring_center = self._robot_base_xy()
+        print(
+            "[INFO] Random workspace ring: "
+            f"center={self.random_workspace_ring_center.round(3).tolist()}, "
+            f"inner_radius={self.random_workspace_inner_radius:.3f}, "
+            f"outer_radius={self.random_workspace_outer_radius:.3f}"
+        )
         if self.spawn_object:
             self._spawn_grasp_object()
             self._spawn_plates()
+            if self.show_random_workspace:
+                self._spawn_random_workspace_visual()
             self._randomize_task_objects()
         self._set_initial_robot_state()
 
@@ -924,6 +949,23 @@ def parse_args():
         help="Randomize the red box yaw angle on each task reset",
     )
     parser.add_argument(
+        "--show-random-workspace",
+        action="store_true",
+        help="Show a red non-colliding visual layer over the task randomization workspace",
+    )
+    parser.add_argument(
+        "--random-workspace-inner-diameter",
+        type=float,
+        default=0.60,
+        help="Inner diameter in meters of the robot-base-centered random workspace ring",
+    )
+    parser.add_argument(
+        "--random-workspace-outer-diameter",
+        type=float,
+        default=1.20,
+        help="Outer diameter in meters of the robot-base-centered random workspace ring",
+    )
+    parser.add_argument(
         "--initial-state",
         type=float,
         nargs=7,
@@ -1041,6 +1083,12 @@ def main():
         print(f"Grasp object size: {args.object_size} m")
         print(f"Randomize all task objects: {'enabled' if args.randomize_all_task_objects else 'disabled'}")
         print(f"Randomize object yaw: {'enabled' if args.randomize_object_yaw else 'disabled'}")
+        print(f"Random workspace visual: {'enabled' if args.show_random_workspace else 'disabled'}")
+        print(
+            "Random workspace ring diameters: "
+            f"inner={args.random_workspace_inner_diameter} m, "
+            f"outer={args.random_workspace_outer_diameter} m"
+        )
     print(f"Initial state: {np.asarray(args.initial_state, dtype=np.float32).tolist()}")
     print(f"Debug timing: {'enabled' if args.debug_timing else 'disabled'}")
     print(f"Debug action interval: {args.debug_action_interval}")
@@ -1091,6 +1139,9 @@ def main():
         debug_action_interval=args.debug_action_interval,
         randomize_all_task_objects=args.randomize_all_task_objects,
         randomize_object_yaw=args.randomize_object_yaw,
+        show_random_workspace=args.show_random_workspace,
+        random_workspace_inner_diameter=args.random_workspace_inner_diameter,
+        random_workspace_outer_diameter=args.random_workspace_outer_diameter,
     )
 
     if not wait_for_human_start(sim, args.wait_for_start, args.policy_mode):
