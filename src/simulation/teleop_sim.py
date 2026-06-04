@@ -733,6 +733,7 @@ class ServoTeleoperatorSim:
                 "Use a raw-data directory for --record-dir, then convert with convert_raw_to_lerobot.py."
             )
         os.makedirs(os.path.join(self.raw_dataset_root, "episodes"), exist_ok=True)
+        self._cleanup_trailing_incomplete_raw_episodes()
 
         camera_shapes = self._expected_record_camera_shapes()
         for camera_name in self.record_cameras:
@@ -752,6 +753,48 @@ class ServoTeleoperatorSim:
             "[INFO] Raw async image writer enabled: "
             f"threads={self.image_writer_threads}, queue_size={self.raw_writer_queue_size}"
         )
+
+    def _raw_episode_index_from_name(self, name: str):
+        if not name.startswith("episode_"):
+            return None
+        try:
+            return int(name.split("_")[-1])
+        except ValueError:
+            return None
+
+    def _is_complete_raw_episode_dir(self, episode_dir: str) -> bool:
+        return os.path.isfile(os.path.join(episode_dir, "meta.json"))
+
+    def _cleanup_trailing_incomplete_raw_episodes(self):
+        episodes_dir = os.path.join(self.raw_dataset_root, "episodes")
+        if not os.path.isdir(episodes_dir):
+            return
+
+        indexed_episodes = []
+        for name in os.listdir(episodes_dir):
+            episode_index = self._raw_episode_index_from_name(name)
+            if episode_index is None:
+                continue
+            episode_dir = os.path.join(episodes_dir, name)
+            if os.path.isdir(episode_dir):
+                indexed_episodes.append((episode_index, episode_dir))
+
+        for _episode_index, episode_dir in sorted(indexed_episodes, reverse=True):
+            if self._is_complete_raw_episode_dir(episode_dir):
+                break
+            shutil.rmtree(episode_dir)
+            print(f"[RECORD] Removed incomplete raw episode from previous run: {episode_dir}")
+
+    def _cleanup_current_incomplete_episode(self):
+        with self.record_lock:
+            episode_dir = self.current_episode_dir
+        if not episode_dir or not os.path.isdir(episode_dir):
+            return
+        if self._is_complete_raw_episode_dir(episode_dir):
+            return
+        print(f"[RECORD] Removing incomplete raw episode: {episode_dir}")
+        shutil.rmtree(episode_dir)
+        self._reset_current_episode_buffer()
 
     def _start_raw_writer(self):
         if self.raw_writer_queue is not None:
@@ -857,12 +900,9 @@ class ServoTeleoperatorSim:
         max_index = -1
         if os.path.isdir(episodes_dir):
             for name in os.listdir(episodes_dir):
-                if not name.startswith("episode_"):
-                    continue
-                try:
-                    max_index = max(max_index, int(name.split("_")[-1]))
-                except ValueError:
-                    continue
+                episode_index = self._raw_episode_index_from_name(name)
+                if episode_index is not None:
+                    max_index = max(max_index, episode_index)
         return max_index + 1
 
     def _expected_record_camera_shapes(self):
@@ -1480,6 +1520,10 @@ class ServoTeleoperatorSim:
                     self._stop_raw_writer()
                 except Exception as exc:
                     print(f"[WARN] Raw writer shutdown failed: {exc}")
+                try:
+                    self._cleanup_current_incomplete_episode()
+                except Exception as exc:
+                    print(f"[WARN] Incomplete raw episode cleanup failed: {exc}")
             self.env.close()
             self.ser.close()
             if self.cv2 is not None:
