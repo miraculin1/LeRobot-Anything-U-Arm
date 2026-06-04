@@ -33,8 +33,14 @@ class TimingStats:
         self.target_period = target_period
         self.step = 0
         self.data = {}
+        self.latest_loop_ms = 0.0
+        self.latest_loop_status = "OK"
 
     def record(self, key: str, seconds: float):
+        if key == "loop.total":
+            self.latest_loop_ms = float(seconds) * 1000.0
+            target_ms = self.target_period * 1000.0
+            self.latest_loop_status = "runout" if self.latest_loop_ms > target_ms else "OK"
         if not self.enabled or self.step < self.warmup:
             return
         values = self.data.setdefault(key, [])
@@ -1180,11 +1186,23 @@ class ServoTeleoperatorSim:
             status = self.status_message
             frames = self.current_episode_frames
         self.cv2.rectangle(frame, (0, 0), (frame.shape[1], 72), (20, 20, 20), -1)
+        loop_status = getattr(self.timing, "latest_loop_status", "OK")
+        loop_color = (0, 220, 0) if loop_status == "OK" else (0, 220, 255)
+        self.cv2.putText(
+            frame,
+            loop_status,
+            (12, 28),
+            self.cv2.FONT_HERSHEY_SIMPLEX,
+            0.75,
+            loop_color,
+            2,
+            self.cv2.LINE_AA,
+        )
         color = (0, 220, 0) if state == "recording" else (0, 220, 255)
         self.cv2.putText(
             frame,
             status,
-            (12, 28),
+            (112, 28),
             self.cv2.FONT_HERSHEY_SIMPLEX,
             0.65,
             color,

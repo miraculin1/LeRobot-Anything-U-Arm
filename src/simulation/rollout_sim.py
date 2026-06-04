@@ -53,6 +53,8 @@ class TimingStats:
         self.target_period = target_period
         self.step = 0
         self.data = {}
+        self.latest_loop_ms = 0.0
+        self.latest_loop_status = "OK"
 
     @contextmanager
     def time(self, key: str):
@@ -66,6 +68,10 @@ class TimingStats:
             self.record(key, time.perf_counter() - start)
 
     def record(self, key: str, seconds: float):
+        if key == "loop.total":
+            self.latest_loop_ms = float(seconds) * 1000.0
+            target_ms = self.target_period * 1000.0
+            self.latest_loop_status = "runout" if self.latest_loop_ms > target_ms else "OK"
         if not self.enabled or self.step < self.warmup:
             return
         values = self.data.setdefault(key, [])
@@ -141,7 +147,9 @@ class ZeroActionRolloutSim(ServoTeleoperatorSim):
         env_render: bool = True,
         show_gripper_plot: bool = True,
         gripper_plot_history: int = 300,
+        gripper_plot_update_rate: float = 5.0,
         gripper_contact_force_threshold: float = 1e-3,
+        debug_action_interval: int = 30,
     ):
         self.SERIAL_PORT = None
         self.BAUDRATE = None
@@ -169,7 +177,11 @@ class ZeroActionRolloutSim(ServoTeleoperatorSim):
         self.env_render = env_render
         self.show_gripper_plot = show_gripper_plot
         self.gripper_plot_history = max(int(gripper_plot_history), 1)
+        self.gripper_plot_update_period = 1.0 / max(float(gripper_plot_update_rate), 1e-6)
+        self._last_gripper_plot_update_time = 0.0
         self.gripper_contact_force_threshold = max(float(gripper_contact_force_threshold), 0.0)
+        self._gripper_clip_warning_count = 0
+        self.debug_action_interval = max(int(debug_action_interval), 0)
         self._gripper_plot = None
         self._gripper_plot_step = deque(maxlen=self.gripper_plot_history)
         self._gripper_plot_state = deque(maxlen=self.gripper_plot_history)
@@ -373,22 +385,64 @@ class ZeroActionRolloutSim(ServoTeleoperatorSim):
             raise RuntimeError(f"Failed to convert '{sensor_name}' image to RGB")
         return frame
 
-    def policy_action_to_env_action(self, policy_action, action_mode: str) -> np.ndarray:
+    def policy_action_to_env_action(
+        self,
+        policy_action,
+        action_mode: str,
+        representation_base_state=None,
+        previous_delta_target=None,
+    ) -> tuple[np.ndarray, np.ndarray | None]:
         policy_action = np.asarray(policy_action, dtype=np.float32).reshape(-1)
         if policy_action.shape != (7,):
             raise ValueError(
                 f"Expected a 7D Piper policy action, got shape {policy_action.shape}"
             )
-        if action_mode == "delta":
-            state = self._get_piper_record_state()
-            if state is None:
-                raise RuntimeError("Failed to read Piper state for delta action conversion")
-            target_state = state.astype(np.float32) + policy_action
-        elif action_mode == "absolute":
+        if action_mode == "absolute":
             target_state = policy_action
+            next_delta_target = None
+        elif action_mode == "relative":
+            if representation_base_state is None:
+                raise RuntimeError(
+                    "Missing inference-time state for LeRobot relative action conversion"
+                )
+            target_state = np.asarray(representation_base_state, dtype=np.float32).reshape(-1)
+            if target_state.shape != (7,):
+                raise ValueError(
+                    "Expected inference-time state with shape (7,) for relative action "
+                    f"conversion, got {target_state.shape}"
+                )
+            target_state = target_state.copy()
+            target_state[:6] += policy_action[:6]
+            target_state[6] = policy_action[6]
+            next_delta_target = None
+        elif action_mode == "delta":
+            if previous_delta_target is None:
+                if representation_base_state is None:
+                    raise RuntimeError(
+                        "Missing inference-time state for LeRobot delta action conversion"
+                    )
+                target_state = np.asarray(
+                    representation_base_state, dtype=np.float32
+                ).reshape(-1)
+                if target_state.shape != (7,):
+                    raise ValueError(
+                        "Expected inference-time state with shape (7,) for delta action "
+                        f"conversion, got {target_state.shape}"
+                    )
+            else:
+                target_state = np.asarray(previous_delta_target, dtype=np.float32).reshape(-1)
+                if target_state.shape != (7,):
+                    raise ValueError(
+                        "Expected previous delta target with shape (7,), got "
+                        f"{target_state.shape}"
+                    )
+            target_state = target_state.copy()
+            target_state[:6] += policy_action[:6]
+            target_state[6] = policy_action[6]
+            next_delta_target = target_state.copy()
         else:
             raise ValueError(f"Unsupported action mode: {action_mode}")
-        return self.piper_state_to_env_action(target_state)
+        return self.piper_state_to_env_action(target_state), next_delta_target
 
     def piper_state_to_env_action(self, state_7) -> np.ndarray:
         state_7 = np.asarray(state_7, dtype=np.float32).reshape(-1)
@@ -396,8 +450,25 @@ class ZeroActionRolloutSim(ServoTeleoperatorSim):
             raise ValueError(f"Expected a 7D Piper state/action, got shape {state_7.shape}")
         env_action = np.zeros(8, dtype=np.float32)
         env_action[:6] = state_7[:6]
-        env_action[6:] = state_7[6]
+        gripper_target = float(state_7[6])
+        clipped_gripper_target = float(np.clip(gripper_target, 0.0, 0.04))
+        env_action[6:] = clipped_gripper_target
         return env_action
+
+    def _log_openpi_action_debug(
+        self,
+        step_count: int,
+        action_mode: str,
+        policy_action,
+        env_action,
+        _state,
+        representation_base_state=None,
+    ):
+        if self.debug_action_interval <= 0 or step_count % self.debug_action_interval != 0:
+            return
+        policy_action = np.asarray(policy_action, dtype=np.float32).reshape(-1)
+        action_values = "\t".join(f"{value:>9.5f}" for value in policy_action[:7])
+        print(f"[ACTION {step_count:>6d} {action_mode:<8}] {action_values}")
 
     def validate_action_chunk(self, response) -> np.ndarray:
         if not isinstance(response, dict) or "actions" not in response:
@@ -507,6 +578,10 @@ class ZeroActionRolloutSim(ServoTeleoperatorSim):
     def _update_gripper_plot(self, step_count: int, state, policy_action):
         if not self.show_gripper_plot:
             return
+        now = time.monotonic()
+        if now - self._last_gripper_plot_update_time < self.gripper_plot_update_period:
+            return
+        self._last_gripper_plot_update_time = now
         self._init_gripper_plot()
         plot = self._gripper_plot
         if not plot["plt"].fignum_exists(plot["fig"].number):
@@ -613,6 +688,8 @@ class ZeroActionRolloutSim(ServoTeleoperatorSim):
         step_count = 0
         actions_from_chunk_completed = 0
         pred_action_chunk = None
+        representation_base_state = None
+        previous_delta_target = None
         period = max(1.0 / self.rate, 1e-6)
         next_time = time.monotonic()
         try:
@@ -628,8 +705,12 @@ class ZeroActionRolloutSim(ServoTeleoperatorSim):
                         )
                     ):
                         actions_from_chunk_completed = 0
+                        previous_delta_target = None
                         with self.timing.time("policy.get_observation_total"):
                             obs = self.get_policy_observation(prompt, image_size)
+                        representation_base_state = np.asarray(
+                            obs["observation/state"], dtype=np.float32
+                        ).reshape(-1)
                         with self.timing.time("policy.infer"):
                             with prevent_keyboard_interrupt():
                                 response = policy_client.infer(obs)
@@ -638,7 +719,12 @@ class ZeroActionRolloutSim(ServoTeleoperatorSim):
                     policy_action = pred_action_chunk[actions_from_chunk_completed]
                     actions_from_chunk_completed += 1
                     with self.timing.time("action.convert"):
-                        env_action = self.policy_action_to_env_action(policy_action, action_mode)
+                        env_action, previous_delta_target = self.policy_action_to_env_action(
+                            policy_action,
+                            action_mode,
+                            representation_base_state=representation_base_state,
+                            previous_delta_target=previous_delta_target,
+                        )
                 else:
                     raise ValueError(f"Unsupported policy mode: {policy_mode}")
 
@@ -646,6 +732,15 @@ class ZeroActionRolloutSim(ServoTeleoperatorSim):
                 self.rollout_step(env_action)
                 step_count += 1
                 state = self._get_piper_record_state()
+                if policy_mode == "openpi":
+                    self._log_openpi_action_debug(
+                        step_count,
+                        action_mode,
+                        policy_action,
+                        env_action,
+                        state,
+                        representation_base_state=representation_base_state,
+                    )
                 with self.timing.time("sim.update_gripper_plot"):
                     self._update_gripper_plot(step_count, state, policy_action)
                 if max_steps is not None and step_count >= max_steps:
@@ -739,9 +834,13 @@ def parse_args():
     )
     parser.add_argument(
         "--action-mode",
-        choices=["delta", "absolute"],
-        default="delta",
-        help="Interpret OpenPI 7D actions as delta from current state or absolute target state",
+        choices=["absolute", "relative", "delta"],
+        default="relative",
+        help=(
+            "OpenPI action representation for arm joints: absolute targets, "
+            "relative offsets from the inference-time state, or sequential deltas. "
+            "The gripper remains absolute."
+        ),
     )
     parser.add_argument(
         "--wait-for-start",
@@ -788,6 +887,12 @@ def parse_args():
         help="Number of recent rollout steps to keep in the gripper plot",
     )
     parser.add_argument(
+        "--gripper-plot-update-rate",
+        type=float,
+        default=5.0,
+        help="Maximum live gripper plot refresh rate in Hz",
+    )
+    parser.add_argument(
         "--gripper-contact-force-threshold",
         type=float,
         default=1e-3,
@@ -824,6 +929,12 @@ def parse_args():
         type=int,
         default=5,
         help="Skip the first N steps when collecting timing diagnostics",
+    )
+    parser.add_argument(
+        "--debug-action-interval",
+        type=int,
+        default=30,
+        help="Print OpenPI action conversion diagnostics every N rollout steps; use 0 to disable",
     )
     parser.add_argument("--record", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--record-dir", type=str, default="./lerobot_data/eazy_sim_data")
@@ -907,6 +1018,7 @@ def main():
     print(f"Wrist display: {'enabled' if args.show_wrist_camera else 'disabled'}")
     print(f"Default camera display: {'disabled' if args.no_display_cameras else 'enabled'}")
     print(f"Gripper plot: {'enabled' if args.show_gripper_plot else 'disabled'}")
+    print(f"Gripper plot update rate: {args.gripper_plot_update_rate} Hz")
     print(f"Gripper contact force threshold: {args.gripper_contact_force_threshold} N")
     if args.no_object:
         print("Grasp object: disabled")
@@ -915,6 +1027,7 @@ def main():
         print(f"Grasp object size: {args.object_size} m")
     print(f"Initial state: {np.asarray(args.initial_state, dtype=np.float32).tolist()}")
     print(f"Debug timing: {'enabled' if args.debug_timing else 'disabled'}")
+    print(f"Debug action interval: {args.debug_action_interval}")
     print(f"Recording: {'enabled' if args.record else 'disabled'}")
     if args.record:
         print(f"Record dir: {os.path.expanduser(args.record_dir)}")
@@ -957,7 +1070,9 @@ def main():
         env_render=args.env_render,
         show_gripper_plot=args.show_gripper_plot,
         gripper_plot_history=args.gripper_plot_history,
+        gripper_plot_update_rate=args.gripper_plot_update_rate,
         gripper_contact_force_threshold=args.gripper_contact_force_threshold,
+        debug_action_interval=args.debug_action_interval,
     )
 
     if not wait_for_human_start(sim, args.wait_for_start, args.policy_mode):

@@ -12,7 +12,6 @@ python src/simulation/teleop_sim.py \
     --no-env-render \
     --control-dwell 0.0 \
     --no-render-preflight \
-    --debug-timing \
     --record \
     --record-dir ./raw_data/eazy_sim_data \
     --repo-id local/teleop_sim \
