@@ -71,7 +71,7 @@ class TimingStats:
         if key == "loop.total":
             self.latest_loop_ms = float(seconds) * 1000.0
             target_ms = self.target_period * 1000.0
-            self.latest_loop_status = "runout" if self.latest_loop_ms > target_ms else "OK"
+            self.latest_loop_status = "OVERRUN" if self.latest_loop_ms > target_ms else "OK"
         if not self.enabled or self.step < self.warmup:
             return
         values = self.data.setdefault(key, [])
