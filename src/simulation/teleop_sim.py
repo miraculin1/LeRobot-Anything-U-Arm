@@ -198,6 +198,7 @@ class ServoTeleoperatorSim:
         self.object_size = object_size
         self.spawn_object = spawn_object
         self.grasp_object = None
+        self.task_boxes = {}
         self.render_mode = render_mode
         self.wrist_camera_width = wrist_camera_width
         self.wrist_camera_height = wrist_camera_height
@@ -242,9 +243,8 @@ class ServoTeleoperatorSim:
         self.record_enabled = record
         self.record_dir = os.path.expanduser(record_dir)
         self.repo_id = repo_id
-        self.task = "put red box to blue plate"
-        if task != self.task:
-            print(f"[WARN] Ignoring --task '{task}'. Fixed task is: {self.task}")
+        self.default_task = task
+        self.task = task
         self.record_cameras = tuple(record_cameras or ("d435_top_camera", "wrist_camera"))
         self.record_fps = int(record_fps)
         self.record_period = 1.0 / max(float(self.record_fps), 1.0)
@@ -275,12 +275,23 @@ class ServoTeleoperatorSim:
         self.countdown_end_time = None
         self.status_message = "Recording disabled"
         self._ui_buttons = {}
+        self.box_specs = [
+            ("red", "red_box", [1.0, 0.0, 0.0, 1.0], (30, 30, 230)),
+            ("orange", "orange_box", [1.0, 0.45, 0.0, 1.0], (0, 150, 255)),
+            ("black", "black_box", [0.02, 0.02, 0.02, 1.0], (20, 20, 20)),
+        ]
+        self.box_color_to_actor = {}
         self.plates = []
         self.plate_specs = [
-            ("blue_plate", [0.05, 0.18, 1.0, 1.0]),
-            ("green_plate", [0.1, 0.7, 0.2, 1.0]),
-            ("yellow_plate", [1.0, 0.85, 0.05, 1.0]),
+            ("blue", "blue_plate", [0.05, 0.18, 1.0, 1.0], (255, 90, 20)),
+            ("green", "green_plate", [0.1, 0.7, 0.2, 1.0], (45, 180, 45)),
+            ("yellow", "yellow_plate", [1.0, 0.85, 0.05, 1.0], (20, 220, 245)),
         ]
+        self.plate_color_to_actor = {}
+        self.current_task_box_color = None
+        self.current_task_plate_color = None
+        self.current_task_box_actor_name = None
+        self.current_task_plate_actor_name = None
         self.plate_radius = 0.045
         self.plate_half_height = 0.004
         self.plate_quat = euler2quat(0, np.pi / 2, 0)
@@ -434,19 +445,27 @@ class ServoTeleoperatorSim:
             camera_viewer.set_camera_pose(sapien.Pose(camera_position, camera_quaternion))
 
     def _spawn_grasp_object(self):
-        """Spawn a simple dynamic cube for teleoperation grasp tests."""
+        """Spawn reusable dynamic task boxes for teleoperation recording."""
         half_size = self.object_size / 2.0
-        self.grasp_object = actors.build_cube(
-            self.env.unwrapped.scene,
-            half_size=half_size,
-            color=[1, 0, 0, 1],
-            name="teleop_cube",
-            body_type="dynamic",
-            initial_pose=sapien.Pose(p=self.object_pos),
-        )
+        self.task_boxes = {}
+        self.box_color_to_actor = {}
+        for idx, (color_name, actor_name, color, _bgr) in enumerate(self.box_specs):
+            box = actors.build_cube(
+                self.env.unwrapped.scene,
+                half_size=half_size,
+                color=color,
+                name=actor_name,
+                body_type="dynamic",
+                initial_pose=sapien.Pose(
+                    p=[self.object_pos[0], self.object_pos[1] + 0.12 * idx, self.object_pos[2]]
+                ),
+            )
+            self.task_boxes[color_name] = box
+            self.box_color_to_actor[color_name] = box
+        self.grasp_object = self.task_boxes.get("red")
         print(
-            f"Spawned grasp object 'teleop_cube' at {self.object_pos} "
-            f"with size {self.object_size} m"
+            f"[INFO] Spawned {len(self.task_boxes)} task boxes: "
+            f"{', '.join(self.task_boxes.keys())}"
         )
 
     def _spawn_plates(self):
@@ -454,7 +473,8 @@ class ServoTeleoperatorSim:
         self.plates = []
         table_z = self.object_pos[2] - self.object_size / 2.0
         plate_z = table_z + self.plate_half_height
-        for idx, (name, color) in enumerate(self.plate_specs):
+        self.plate_color_to_actor = {}
+        for idx, (color_name, name, color, _bgr) in enumerate(self.plate_specs):
             plate = actors.build_cylinder(
                 self.env.unwrapped.scene,
                 radius=self.plate_radius,
@@ -468,6 +488,7 @@ class ServoTeleoperatorSim:
                 ),
             )
             self.plates.append(plate)
+            self.plate_color_to_actor[color_name] = plate
         print(f"[INFO] Spawned {len(self.plates)} colored plates: blue, green, yellow")
 
     def _spawn_random_workspace_visual(self):
@@ -565,29 +586,36 @@ class ServoTeleoperatorSim:
         return sampled_points
 
     def _randomize_task_objects(self):
-        if not self.spawn_object or self.grasp_object is None:
+        if not self.spawn_object or not self.task_boxes:
             return
         rng = np.random.default_rng()
+        box_items = list(self.task_boxes.items())
         if self.randomize_all_task_objects:
-            sampled_points = self._sample_non_overlapping_xy(1 + len(self.plates))
-            red_box_xy = sampled_points[0]
-            plate_points = sampled_points[1:]
-            random_plate_points = plate_points
+            sampled_points = self._sample_non_overlapping_xy(len(box_items) + len(self.plates))
+            box_points = sampled_points[:len(box_items)]
+            plate_points = sampled_points[len(box_items):]
         else:
-            red_box_xy = self.fixed_red_box_xy
             fixed_points = [self.fixed_red_box_xy, self.fixed_blue_plate_xy]
-            random_plate_points = self._sample_non_overlapping_xy(
-                max(0, len(self.plates) - 1),
+            sampled_points = self._sample_non_overlapping_xy(
+                max(0, len(box_items) - 1) + max(0, len(self.plates) - 1),
                 existing_points=fixed_points,
             )
+            random_box_points = sampled_points[:max(0, len(box_items) - 1)]
+            random_plate_points = sampled_points[max(0, len(box_items) - 1):]
+            box_points = [self.fixed_red_box_xy] + random_box_points
             plate_points = [self.fixed_blue_plate_xy] + random_plate_points
-        object_yaw = float(rng.uniform(0.0, 2.0 * np.pi)) if self.randomize_object_yaw else 0.0
-        cube_pose = sapien.Pose(
-            p=[red_box_xy[0], red_box_xy[1], self.object_pos[2]],
-            q=euler2quat(0, 0, object_yaw),
-        )
-        self.grasp_object.set_pose(cube_pose)
-        self._zero_actor_velocity(self.grasp_object)
+        box_summaries = []
+        for (color_name, box), point in zip(box_items, box_points):
+            yaw = float(rng.uniform(0.0, 2.0 * np.pi)) if self.randomize_object_yaw else 0.0
+            pose = sapien.Pose(
+                p=[point[0], point[1], self.object_pos[2]],
+                q=euler2quat(0, 0, yaw),
+            )
+            box.set_pose(pose)
+            self._zero_actor_velocity(box)
+            box_summaries.append(
+                f"{color_name} xy={point.round(3).tolist()}, yaw={yaw:.3f} rad"
+            )
         table_z = self.object_pos[2] - self.object_size / 2.0
         plate_z = table_z + self.plate_half_height
         for plate, point in zip(self.plates, plate_points):
@@ -595,8 +623,7 @@ class ServoTeleoperatorSim:
             self._zero_actor_velocity(plate)
         print(
             "[INFO] Randomized task objects: "
-            f"red box xy={red_box_xy.round(3).tolist()}, "
-            f"red box yaw={object_yaw:.3f} rad, "
+            f"boxes={box_summaries}, "
             f"plate xys={[point.round(3).tolist() for point in plate_points]}, "
             f"all_random={self.randomize_all_task_objects}"
         )
@@ -635,11 +662,46 @@ class ServoTeleoperatorSim:
     def _collect_initial_task_object_poses(self):
         poses = {}
         if self.spawn_object:
-            poses["red_box"] = self._actor_pose(self.grasp_object, "red_box")
+            poses["boxes"] = {}
+            for color_name, box in self.task_boxes.items():
+                poses["boxes"][f"{color_name}_box"] = self._actor_pose(
+                    box, f"{color_name}_box"
+                )
+            if "red" in self.task_boxes:
+                poses["red_box"] = self._actor_pose(self.task_boxes["red"], "red_box")
             poses["plates"] = {}
-            for plate, (name, _color) in zip(self.plates, self.plate_specs):
+            for plate, (_color_name, name, _color, _bgr) in zip(self.plates, self.plate_specs):
                 poses["plates"][name] = self._actor_pose(plate, name)
         return poses
+
+    def _sample_recording_task(self):
+        if not self.task_boxes or not self.plate_color_to_actor:
+            return
+        rng = np.random.default_rng()
+        box_color = str(rng.choice([spec[0] for spec in self.box_specs]))
+        plate_color = str(rng.choice([spec[0] for spec in self.plate_specs]))
+        self.current_task_box_color = box_color
+        self.current_task_plate_color = plate_color
+        self.grasp_object = self.task_boxes[box_color]
+        self.current_task_box_actor_name = f"{box_color}_box"
+        self.current_task_plate_actor_name = f"{plate_color}_plate"
+        self.task = f"put {box_color} box to {plate_color} plate"
+        print(f"[TASK] {self.current_task_box_actor_name} -> {self.current_task_plate_actor_name}: {self.task}")
+
+    def _current_task_metadata(self):
+        return {
+            "task": self.task,
+            "box_color": self.current_task_box_color,
+            "plate_color": self.current_task_plate_color,
+            "box_actor": self.current_task_box_actor_name,
+            "plate_actor": self.current_task_plate_actor_name,
+        }
+
+    def _task_color_bgr(self, color_name: str, specs):
+        for spec_color_name, _actor_name, _rgba, bgr in specs:
+            if spec_color_name == color_name:
+                return bgr
+        return (230, 230, 230)
 
     def _get_piper_end_effector_pose(self):
         agent = getattr(self.env.unwrapped, "agent", None)
@@ -1023,6 +1085,8 @@ class ServoTeleoperatorSim:
         self.raw_writer_threads = []
 
     def _begin_recording_episode(self):
+        if self.spawn_object and self.current_task_box_color is None:
+            self._sample_recording_task()
         episode_index = self._next_raw_episode_index()
         episode_dir = os.path.join(
             self.raw_dataset_root, "episodes", f"episode_{episode_index:06d}"
@@ -1132,6 +1196,7 @@ class ServoTeleoperatorSim:
             "num_frames": self.current_episode_frames,
             "camera_shapes": self.current_episode_camera_shapes,
             "initial_task_object_poses": self.current_episode_initial_task_object_poses,
+            "selected_task": self._current_task_metadata(),
             "started_at_unix": self.current_episode_started_at,
             "saved_at_unix": time.time(),
         }
@@ -1164,6 +1229,7 @@ class ServoTeleoperatorSim:
 
     def _start_next_episode_countdown(self):
         self._randomize_task_objects()
+        self._sample_recording_task()
         with self.record_lock:
             self.record_state = "countdown"
             self.countdown_end_time = time.monotonic() + 3.0
@@ -1388,7 +1454,10 @@ class ServoTeleoperatorSim:
             state = self.record_state
             status = self.status_message
             frames = self.current_episode_frames
-        self.cv2.rectangle(frame, (0, 0), (frame.shape[1], 72), (20, 20, 20), -1)
+            box_color = self.current_task_box_color
+            plate_color = self.current_task_plate_color
+            task = self.task
+        self.cv2.rectangle(frame, (0, 0), (frame.shape[1], 112), (20, 20, 20), -1)
         loop_status = getattr(self.timing, "latest_loop_status", "OK")
         loop_color = (0, 220, 0) if loop_status == "OK" else (0, 220, 255)
         self.cv2.putText(
@@ -1420,6 +1489,28 @@ class ServoTeleoperatorSim:
             0.5,
             (230, 230, 230),
             1,
+            self.cv2.LINE_AA,
+        )
+        task_label = (
+            f"{box_color} box -> {plate_color} plate"
+            if box_color and plate_color
+            else task
+        )
+        box_bgr = self._task_color_bgr(box_color, self.box_specs)
+        plate_bgr = self._task_color_bgr(plate_color, self.plate_specs)
+        self.cv2.rectangle(frame, (12, 76), (42, 102), box_bgr, -1)
+        self.cv2.rectangle(frame, (12, 76), (42, 102), (245, 245, 245), 1)
+        self.cv2.arrowedLine(frame, (52, 89), (104, 89), (245, 245, 245), 2, tipLength=0.28)
+        self.cv2.rectangle(frame, (114, 76), (144, 102), plate_bgr, -1)
+        self.cv2.rectangle(frame, (114, 76), (144, 102), (245, 245, 245), 1)
+        self.cv2.putText(
+            frame,
+            task_label,
+            (158, 96),
+            self.cv2.FONT_HERSHEY_SIMPLEX,
+            0.68,
+            (245, 245, 245),
+            2,
             self.cv2.LINE_AA,
         )
         buttons = []
@@ -1825,12 +1916,12 @@ if __name__ == "__main__":
     parser.add_argument(
         '--randomize-all-task-objects',
         action='store_true',
-        help='Randomize the red box and all colored plates within the task workspace'
+        help='Randomize all task boxes and colored plates within the task workspace'
     )
     parser.add_argument(
         '--randomize-object-yaw',
         action='store_true',
-        help='Randomize the red box yaw angle on each task reset'
+        help='Randomize each task box yaw angle on each task reset'
     )
     parser.add_argument(
         '--show-random-workspace',
@@ -1870,7 +1961,7 @@ if __name__ == "__main__":
         '--task',
         type=str,
         default='put red box to blue plate',
-        help='Task string saved with each frame; this script fixes it to put red box to blue plate'
+        help='Fallback task string; recording episodes randomly sample box-to-plate tasks'
     )
     parser.add_argument(
         '--record-cameras',
@@ -1969,7 +2060,7 @@ if __name__ == "__main__":
     if args.record:
         print(f"Record dir:       {os.path.expanduser(args.record_dir)}")
         print(f"Repo id:          {args.repo_id}")
-        print(f"Task:             put red box to blue plate")
+        print("Task sampling:    random box-to-plate episode tasks")
         print(f"Record cameras:   {record_cameras}")
         print(f"Record FPS:       {args.record_fps}")
         print(f"Raw writer:       {max(1, args.image_writer_threads)} threads, queue={args.raw_writer_queue_size}")

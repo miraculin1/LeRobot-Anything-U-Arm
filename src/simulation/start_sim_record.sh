@@ -21,7 +21,6 @@ python src/simulation/teleop_sim.py \
     --record \
     --record-dir ./raw_data/hard_sim_data \
     --repo-id local/teleop_sim \
-    --task "put red box to blue plate" \
     --record-cameras d435_top_camera,wrist_camera \
     --record-fps 30 \
     --image-writer-processes 0 \
