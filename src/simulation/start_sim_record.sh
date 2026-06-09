@@ -6,6 +6,8 @@ cd "$(dirname "$0")/../.."
 source /home/ros/miniforge3/bin/activate
 conda activate uarm
 
+echo "[INFO] Raw recording includes initial object poses and per-frame end-effector poses."
+
 python src/simulation/teleop_sim.py \
     --robot piper \
     --render-mode sensors \

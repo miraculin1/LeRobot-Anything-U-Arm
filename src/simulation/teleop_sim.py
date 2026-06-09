@@ -260,6 +260,7 @@ class ServoTeleoperatorSim:
         self.current_episode_dir = None
         self.current_episode_frames_data = []
         self.current_episode_camera_shapes = {}
+        self.current_episode_initial_task_object_poses = {}
         self.current_episode_started_at = None
         self.latest_teleop_target = None
         self.record_state = "disabled" if not self.record_enabled else "initializing"
@@ -605,6 +606,52 @@ class ServoTeleoperatorSim:
             method = getattr(actor, method_name, None)
             if callable(method):
                 method(np.zeros(3, dtype=np.float32))
+
+    def _json_float_list(self, value, expected_size: int, label: str):
+        if value is None:
+            raise RuntimeError(f"Cannot record {label}: value is unavailable")
+        if hasattr(value, "detach"):
+            value = value.detach().cpu().numpy()
+        original_shape = np.asarray(value).shape
+        arr = np.asarray(value, dtype=np.float64).reshape(-1)
+        if arr.size != expected_size:
+            raise RuntimeError(
+                f"Expected {expected_size} values for {label}, got shape {original_shape}"
+            )
+        return arr.astype(float).tolist()
+
+    def _actor_pose(self, actor, label: str):
+        if actor is None:
+            raise RuntimeError(f"Cannot record pose for {label}: actor is unavailable")
+        get_pose = getattr(actor, "get_pose", None)
+        pose = get_pose() if callable(get_pose) else getattr(actor, "pose", None)
+        if pose is None:
+            raise RuntimeError(f"Cannot record pose for {label}: pose is unavailable")
+        return {
+            "position": self._json_float_list(getattr(pose, "p", None), 3, f"{label}.position"),
+            "quaternion": self._json_float_list(getattr(pose, "q", None), 4, f"{label}.quaternion"),
+        }
+
+    def _collect_initial_task_object_poses(self):
+        poses = {}
+        if self.spawn_object:
+            poses["red_box"] = self._actor_pose(self.grasp_object, "red_box")
+            poses["plates"] = {}
+            for plate, (name, _color) in zip(self.plates, self.plate_specs):
+                poses["plates"][name] = self._actor_pose(plate, name)
+        return poses
+
+    def _get_piper_end_effector_pose(self):
+        agent = getattr(self.env.unwrapped, "agent", None)
+        if agent is None:
+            raise RuntimeError("Cannot record end-effector pose: env has no agent")
+        robot = getattr(agent, "robot", None)
+        if robot is None:
+            raise RuntimeError("Cannot record end-effector pose: agent has no robot")
+        links_map = getattr(robot, "links_map", None)
+        if not links_map or "link6" not in links_map:
+            raise RuntimeError("Cannot record end-effector pose: Piper link6 is unavailable")
+        return self._actor_pose(links_map["link6"], "end_effector")
 
     def _setup_h1_standing_pose(self):
         """Set initial standing pose for H1 robot"""
@@ -993,6 +1040,7 @@ class ServoTeleoperatorSim:
             self.current_episode_frames = 0
             self.current_episode_frames_data = []
             self.current_episode_camera_shapes = {}
+            self.current_episode_initial_task_object_poses = self._collect_initial_task_object_poses()
             self.current_episode_index = episode_index
             self.current_episode_dir = episode_dir
             self.current_episode_started_at = time.time()
@@ -1083,6 +1131,7 @@ class ServoTeleoperatorSim:
             "teleop_target_semantics": "mapped_robot_absolute_target",
             "num_frames": self.current_episode_frames,
             "camera_shapes": self.current_episode_camera_shapes,
+            "initial_task_object_poses": self.current_episode_initial_task_object_poses,
             "started_at_unix": self.current_episode_started_at,
             "saved_at_unix": time.time(),
         }
@@ -1105,6 +1154,7 @@ class ServoTeleoperatorSim:
         self.current_episode_dir = None
         self.current_episode_frames_data = []
         self.current_episode_camera_shapes = {}
+        self.current_episode_initial_task_object_poses = {}
         self.current_episode_started_at = None
 
     def _discard_current_episode(self):
@@ -1249,6 +1299,7 @@ class ServoTeleoperatorSim:
             return
         with NullTimer(self.timing, "record.state"):
             state = self._get_piper_record_state()
+            end_effector_pose = self._get_piper_end_effector_pose()
         if camera_frames is None:
             with NullTimer(self.timing, "record.cameras"):
                 record_camera_frames = self._collect_record_camera_frames()
@@ -1281,6 +1332,7 @@ class ServoTeleoperatorSim:
                     "timestamp": timestamp,
                     "observation_state": state.astype(np.float32).tolist(),
                     "teleop_target": teleop_target.astype(np.float32).tolist(),
+                    "end_effector_pose": end_effector_pose,
                     "images": image_paths,
                 }
             )
