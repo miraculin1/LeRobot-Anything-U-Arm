@@ -25,4 +25,5 @@ python src/simulation/evaluate_openpi_rollout.py \
     --randomize-object-yaw \
     --random-workspace-inner-diameter 0.60 \
     --random-workspace-outer-diameter 1.20 \
+    --output-dir eval_resual/random_task/origin_12000 \
     "$@"

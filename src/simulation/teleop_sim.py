@@ -19,6 +19,23 @@ from mani_skill.render import PREBUILT_SHADER_CONFIGS
 from mani_skill.utils import sapien_utils
 from mani_skill.utils.building import actors
 
+try:
+    from sim_env_base import (
+        BOX_SPECS,
+        FIXED_BLUE_PLATE_XY,
+        FIXED_RED_BOX_XY,
+        PLATE_SPECS,
+        RANDOM_WORKSPACE,
+    )
+except ModuleNotFoundError:
+    from .sim_env_base import (
+        BOX_SPECS,
+        FIXED_BLUE_PLATE_XY,
+        FIXED_RED_BOX_XY,
+        PLATE_SPECS,
+        RANDOM_WORKSPACE,
+    )
+
 
 SHADER_PACK_ALIASES = {
     "fast_rt": "rt-fast",
@@ -133,6 +150,48 @@ class ServoTeleoperatorSim:
     Supports reading servo angles through serial port and mapping to different types of robot arm simulation environments.
     Supported robot arm types: arx-x5, so100, xarm6_robotiq, panda, x_fetch, unitree_h1
     """
+
+    def _init_task_scene_config(
+        self,
+        randomize_all_task_objects: bool,
+        randomize_object_yaw: bool,
+        show_random_workspace: bool,
+        random_workspace_inner_diameter: float,
+        random_workspace_outer_diameter: float,
+    ):
+        """Initialize shared task-scene state used by teleop recording and rollout."""
+        self.box_specs = list(BOX_SPECS)
+        self.task_boxes = {}
+        self.box_color_to_actor = {}
+        self.plates = []
+        self.plate_specs = list(PLATE_SPECS)
+        self.plate_color_to_actor = {}
+        self.current_task_box_color = None
+        self.current_task_plate_color = None
+        self.current_task_box_actor_name = None
+        self.current_task_plate_actor_name = None
+        self.plate_radius = 0.045
+        self.plate_half_height = 0.004
+        self.plate_quat = euler2quat(0, np.pi / 2, 0)
+        self.random_workspace = dict(RANDOM_WORKSPACE)
+        self.min_object_spacing = 0.10
+        self.fixed_red_box_xy = FIXED_RED_BOX_XY.copy()
+        self.fixed_blue_plate_xy = FIXED_BLUE_PLATE_XY.copy()
+        self.randomize_all_task_objects = bool(randomize_all_task_objects)
+        self.randomize_object_yaw = bool(randomize_object_yaw)
+        self.show_random_workspace = bool(show_random_workspace)
+        self.random_workspace_visual = None
+        self.random_workspace_ring_center = None
+        self.random_workspace_inner_radius = float(random_workspace_inner_diameter) / 2.0
+        self.random_workspace_outer_radius = float(random_workspace_outer_diameter) / 2.0
+        if (
+            self.random_workspace_inner_radius < 0.0
+            or self.random_workspace_outer_radius <= self.random_workspace_inner_radius
+        ):
+            raise ValueError(
+                "Expected 0 <= --random-workspace-inner-diameter "
+                "< --random-workspace-outer-diameter"
+            )
     
     def __init__(self, scene: str, robot_uids: str, serial_port: str = '/dev/ttyUSB0',
                  object_pos=None, object_size: float = 0.04, spawn_object: bool = True,
@@ -245,6 +304,7 @@ class ServoTeleoperatorSim:
         self.repo_id = repo_id
         self.default_task = task
         self.task = task
+        self.task_overlay_style = "color_arrow"
         self.record_cameras = tuple(record_cameras or ("d435_top_camera", "wrist_camera"))
         self.record_fps = int(record_fps)
         self.record_period = 1.0 / max(float(self.record_fps), 1.0)
@@ -275,45 +335,13 @@ class ServoTeleoperatorSim:
         self.countdown_end_time = None
         self.status_message = "Recording disabled"
         self._ui_buttons = {}
-        self.box_specs = [
-            ("red", "red_box", [1.0, 0.0, 0.0, 1.0], (30, 30, 230)),
-            ("orange", "orange_box", [1.0, 0.45, 0.0, 1.0], (0, 150, 255)),
-            ("black", "black_box", [0.02, 0.02, 0.02, 1.0], (20, 20, 20)),
-        ]
-        self.box_color_to_actor = {}
-        self.plates = []
-        self.plate_specs = [
-            ("blue", "blue_plate", [0.05, 0.18, 1.0, 1.0], (255, 90, 20)),
-            ("green", "green_plate", [0.1, 0.7, 0.2, 1.0], (45, 180, 45)),
-            ("yellow", "yellow_plate", [1.0, 0.85, 0.05, 1.0], (20, 220, 245)),
-        ]
-        self.plate_color_to_actor = {}
-        self.current_task_box_color = None
-        self.current_task_plate_color = None
-        self.current_task_box_actor_name = None
-        self.current_task_plate_actor_name = None
-        self.plate_radius = 0.045
-        self.plate_half_height = 0.004
-        self.plate_quat = euler2quat(0, np.pi / 2, 0)
-        self.random_workspace = dict(x=(0.195, 0.773), y=(-2.059, -0.891))
-        self.min_object_spacing = 0.10
-        self.fixed_red_box_xy = np.array([0.457, -1.612], dtype=np.float64)
-        self.fixed_blue_plate_xy = np.array([0.577, -1.612], dtype=np.float64)
-        self.randomize_all_task_objects = bool(randomize_all_task_objects)
-        self.randomize_object_yaw = bool(randomize_object_yaw)
-        self.show_random_workspace = bool(show_random_workspace)
-        self.random_workspace_visual = None
-        self.random_workspace_ring_center = None
-        self.random_workspace_inner_radius = float(random_workspace_inner_diameter) / 2.0
-        self.random_workspace_outer_radius = float(random_workspace_outer_diameter) / 2.0
-        if (
-            self.random_workspace_inner_radius < 0.0
-            or self.random_workspace_outer_radius <= self.random_workspace_inner_radius
-        ):
-            raise ValueError(
-                "Expected 0 <= --random-workspace-inner-diameter "
-                "< --random-workspace-outer-diameter"
-            )
+        self._init_task_scene_config(
+            randomize_all_task_objects=randomize_all_task_objects,
+            randomize_object_yaw=randomize_object_yaw,
+            show_random_workspace=show_random_workspace,
+            random_workspace_inner_diameter=random_workspace_inner_diameter,
+            random_workspace_outer_diameter=random_workspace_outer_diameter,
+        )
         
         # Initialize servos and calibrate zero position
         self._init_servos()
@@ -1491,28 +1519,40 @@ class ServoTeleoperatorSim:
             1,
             self.cv2.LINE_AA,
         )
-        task_label = (
-            f"{box_color} box -> {plate_color} plate"
-            if box_color and plate_color
-            else task
-        )
-        box_bgr = self._task_color_bgr(box_color, self.box_specs)
-        plate_bgr = self._task_color_bgr(plate_color, self.plate_specs)
-        self.cv2.rectangle(frame, (12, 76), (42, 102), box_bgr, -1)
-        self.cv2.rectangle(frame, (12, 76), (42, 102), (245, 245, 245), 1)
-        self.cv2.arrowedLine(frame, (52, 89), (104, 89), (245, 245, 245), 2, tipLength=0.28)
-        self.cv2.rectangle(frame, (114, 76), (144, 102), plate_bgr, -1)
-        self.cv2.rectangle(frame, (114, 76), (144, 102), (245, 245, 245), 1)
-        self.cv2.putText(
-            frame,
-            task_label,
-            (158, 96),
-            self.cv2.FONT_HERSHEY_SIMPLEX,
-            0.68,
-            (245, 245, 245),
-            2,
-            self.cv2.LINE_AA,
-        )
+        if getattr(self, "task_overlay_style", "color_arrow") == "prompt_text":
+            self.cv2.putText(
+                frame,
+                f"prompt: {task}",
+                (12, 96),
+                self.cv2.FONT_HERSHEY_SIMPLEX,
+                0.68,
+                (245, 245, 245),
+                2,
+                self.cv2.LINE_AA,
+            )
+        else:
+            task_label = (
+                f"{box_color} box -> {plate_color} plate"
+                if box_color and plate_color
+                else task
+            )
+            box_bgr = self._task_color_bgr(box_color, self.box_specs)
+            plate_bgr = self._task_color_bgr(plate_color, self.plate_specs)
+            self.cv2.rectangle(frame, (12, 76), (42, 102), box_bgr, -1)
+            self.cv2.rectangle(frame, (12, 76), (42, 102), (245, 245, 245), 1)
+            self.cv2.arrowedLine(frame, (52, 89), (104, 89), (245, 245, 245), 2, tipLength=0.28)
+            self.cv2.rectangle(frame, (114, 76), (144, 102), plate_bgr, -1)
+            self.cv2.rectangle(frame, (114, 76), (144, 102), (245, 245, 245), 1)
+            self.cv2.putText(
+                frame,
+                task_label,
+                (158, 96),
+                self.cv2.FONT_HERSHEY_SIMPLEX,
+                0.68,
+                (245, 245, 245),
+                2,
+                self.cv2.LINE_AA,
+            )
         buttons = []
         if state == "recording":
             buttons.append(("Stop Episode", "stop", (frame.shape[1] - 190, 16, 176, 40)))

@@ -164,6 +164,7 @@ def make_policy_client(args):
 
 def run_episode(sim: ZeroActionRolloutSim, args, policy_client, episode_index: int):
     sim.stop_event.clear()
+    sim.task = args.prompt
     sim._set_initial_robot_state()
     sim._randomize_task_objects()
 

@@ -204,7 +204,7 @@ class ZeroActionRolloutSim(ServoTeleoperatorSim):
         if self.show_wrist_camera:
             if self.robot_uids != "piper":
                 raise ValueError("--show-wrist-camera is only supported for --robot piper")
-        if self.show_wrist_camera or self.show_default_sensor_cameras:
+        if self.show_wrist_camera or self.show_default_sensor_cameras or record:
             try:
                 import cv2
             except ImportError as exc:
@@ -230,10 +230,26 @@ class ZeroActionRolloutSim(ServoTeleoperatorSim):
         self.task = "put red box to blue plate"
         if task != self.task:
             print(f"[WARN] Ignoring --task '{task}'. Fixed task is: {self.task}")
+        self.task_overlay_style = "prompt_text"
         self.record_cameras = tuple(record_cameras or ("d435_top_camera", "wrist_camera"))
         self.record_fps = int(record_fps)
         self.record_period = 1.0 / max(float(self.record_fps), 1.0)
         self.dataset = None
+        self.image_writer_processes = 0
+        self.image_writer_threads = 4
+        self.raw_writer_queue_size = 256
+        self.raw_writer_queue = None
+        self.raw_writer_threads = []
+        self.raw_writer_errors = []
+        self.raw_writer_backpressure_warned = False
+        self.raw_dataset_root = None
+        self.current_episode_index = 0
+        self.current_episode_dir = None
+        self.current_episode_frames_data = []
+        self.current_episode_camera_shapes = {}
+        self.current_episode_initial_task_object_poses = {}
+        self.current_episode_started_at = None
+        self.latest_teleop_target = None
         self.record_state = "disabled" if not self.record_enabled else "initializing"
         self.record_lock = Lock()
         self.pending_stop_episode = False
@@ -246,34 +262,13 @@ class ZeroActionRolloutSim(ServoTeleoperatorSim):
         self.countdown_end_time = None
         self.status_message = "Recording disabled"
         self._ui_buttons = {}
-        self.plates = []
-        self.plate_specs = [
-            ("blue_plate", [0.05, 0.18, 1.0, 1.0]),
-            ("green_plate", [0.1, 0.7, 0.2, 1.0]),
-            ("yellow_plate", [1.0, 0.85, 0.05, 1.0]),
-        ]
-        self.plate_radius = 0.045
-        self.plate_half_height = 0.004
-        self.plate_quat = euler2quat(0, np.pi / 2, 0)
-        self.random_workspace = dict(x=(0.195, 0.773), y=(-2.059, -0.891))
-        self.min_object_spacing = 0.10
-        self.fixed_red_box_xy = np.array([0.457, -1.612], dtype=np.float64)
-        self.fixed_blue_plate_xy = np.array([0.577, -1.612], dtype=np.float64)
-        self.randomize_all_task_objects = bool(randomize_all_task_objects)
-        self.randomize_object_yaw = bool(randomize_object_yaw)
-        self.show_random_workspace = bool(show_random_workspace)
-        self.random_workspace_visual = None
-        self.random_workspace_ring_center = None
-        self.random_workspace_inner_radius = float(random_workspace_inner_diameter) / 2.0
-        self.random_workspace_outer_radius = float(random_workspace_outer_diameter) / 2.0
-        if (
-            self.random_workspace_inner_radius < 0.0
-            or self.random_workspace_outer_radius <= self.random_workspace_inner_radius
-        ):
-            raise ValueError(
-                "Expected 0 <= --random-workspace-inner-diameter "
-                "< --random-workspace-outer-diameter"
-            )
+        self._init_task_scene_config(
+            randomize_all_task_objects=randomize_all_task_objects,
+            randomize_object_yaw=randomize_object_yaw,
+            show_random_workspace=show_random_workspace,
+            random_workspace_inner_diameter=random_workspace_inner_diameter,
+            random_workspace_outer_diameter=random_workspace_outer_diameter,
+        )
         self.initial_state = self._validate_initial_state(initial_state)
         self.initial_env_action = self.piper_state_to_env_action(self.initial_state)
 
@@ -341,8 +336,39 @@ class ZeroActionRolloutSim(ServoTeleoperatorSim):
         if self.render_preflight:
             self._run_render_preflight()
         if self.record_enabled:
-            self._setup_lerobot_dataset()
+            self._setup_raw_recorder()
             self._begin_recording_episode()
+
+    def _spawn_grasp_object(self):
+        """Spawn the rollout target object while reusing shared task metadata."""
+        half_size = self.object_size / 2.0
+        red_spec = next(spec for spec in self.box_specs if spec[0] == "red")
+        color_name, actor_name, color, _bgr = red_spec
+        box = actors.build_cube(
+            self.env.unwrapped.scene,
+            half_size=half_size,
+            color=color,
+            name=actor_name,
+            body_type="dynamic",
+            initial_pose=sapien.Pose(p=self.object_pos),
+        )
+        self.task_boxes = {color_name: box}
+        self.box_color_to_actor = {color_name: box}
+        self.grasp_object = box
+        self.current_task_box_color = color_name
+        self.current_task_box_actor_name = actor_name
+        self.current_task_plate_color = "blue"
+        self.current_task_plate_actor_name = "blue_plate"
+        self.task = "put red box to blue plate"
+        print(f"[INFO] Spawned rollout target box '{actor_name}' with size {self.object_size} m")
+
+    def _sample_recording_task(self):
+        self.current_task_box_color = "red"
+        self.current_task_plate_color = "blue"
+        self.current_task_box_actor_name = "red_box"
+        self.current_task_plate_actor_name = "blue_plate"
+        self.grasp_object = self.task_boxes.get("red", self.grasp_object)
+        self.task = "put red box to blue plate"
 
     def _spawn_distractor_box(self, name: str, color, y_offset: float):
         """Spawn a rollout-only dynamic cube as a distractor object."""
@@ -631,6 +657,8 @@ class ZeroActionRolloutSim(ServoTeleoperatorSim):
 
     def rollout_step(self, env_action):
         self._process_recording_events()
+        with self.record_lock:
+            self.latest_teleop_target = np.asarray(env_action, dtype=np.float32).copy()
         with self.timing.time("sim.env_step"):
             self.env.step(env_action)
         if self.env_render:
@@ -758,41 +786,22 @@ class ZeroActionRolloutSim(ServoTeleoperatorSim):
         if self._gripper_plot is not None:
             self._gripper_plot["plt"].close(self._gripper_plot["fig"])
             self._gripper_plot = None
-        if self.record_enabled and self.dataset is not None:
-            finalize = getattr(self.dataset, "finalize", None)
-            if callable(finalize):
-                finalize()
+        if self.record_enabled:
+            try:
+                self._stop_raw_writer()
+            except Exception as exc:
+                print(f"[WARN] Raw writer shutdown failed: {exc}")
+            try:
+                self._cleanup_current_incomplete_episode()
+            except Exception as exc:
+                print(f"[WARN] Incomplete raw episode cleanup failed: {exc}")
         if getattr(self, "env", None) is not None:
             self.env.close()
         if self.cv2 is not None:
             self.cv2.destroyAllWindows()
 
-    def _record_current_frame(self):
-        if not self.record_enabled:
-            return
-        with self.record_lock:
-            if self.record_state != "recording":
-                return
-        now = time.monotonic()
-        if self.last_record_time and now - self.last_record_time < self.record_period:
-            return
-        state = self._get_piper_record_state()
-        camera_frames = self._collect_record_camera_frames()
-        if state is None or camera_frames is None:
-            return
-        frame = {
-            "observation.state": state.astype(np.float32),
-            "action": self.zero_policy_action(),
-        }
-        frame.update(camera_frames)
-        timestamp = self.current_episode_frames / float(self.record_fps)
-        self.dataset.add_frame(frame, task=self.task, timestamp=timestamp)
-        self.last_recorded_state = state.copy()
-        self.last_record_time = now
-        self.current_episode_frames += 1
-        if self.current_episode_frames == 1 or self.current_episode_frames % self.record_fps == 0:
-            episode_index = self._current_dataset_episode_index()
-            print(f"[RECORD] Episode {episode_index}: {self.current_episode_frames} frames")
+    def _record_current_frame(self, camera_frames=None):
+        return super()._record_current_frame(camera_frames)
 
     def run(
         self,
@@ -805,6 +814,7 @@ class ZeroActionRolloutSim(ServoTeleoperatorSim):
         image_size: int = 224,
         action_mode: str = "delta",
     ):
+        self.task = prompt
         print(f"Starting {policy_mode} rollout...")
         print("Policy action shape: 7")
         print(f"Control frequency: {self.rate} Hz")
@@ -900,7 +910,6 @@ class ZeroActionRolloutSim(ServoTeleoperatorSim):
             if (
                 save_on_exit
                 and self.record_enabled
-                and self.dataset is not None
                 and self.current_episode_frames > 0
             ):
                 self._save_current_episode()

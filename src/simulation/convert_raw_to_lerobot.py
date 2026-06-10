@@ -394,6 +394,7 @@ def prepare_resume_dataset(
             f"{len(raw_episodes)} episodes."
         )
 
+    print(f"[RESUME] Checking {len(episode_rows)} existing output episodes...")
     bad_by_index = {}
     for row in episode_rows:
         episode_index = int(row["episode_index"])
@@ -406,6 +407,9 @@ def prepare_resume_dataset(
         )
         if not ok:
             bad_by_index[episode_index] = reason
+            print(f"[RESUME] episode_{episode_index:06d}: BAD - {reason}")
+        else:
+            print(f"[RESUME] episode_{episode_index:06d}: OK")
 
     if bad_by_index:
         first_bad_index = min(bad_by_index)
@@ -453,6 +457,7 @@ def prepare_resume_dataset(
     if image_writer_processes or image_writer_threads:
         dataset.start_image_writer(image_writer_processes, image_writer_threads)
     dataset.episode_buffer = dataset.create_episode_buffer()
+    print(f"[RESUME] Continuing from raw episode index {len(episode_rows)}")
     return dataset, len(episode_rows)
 
 

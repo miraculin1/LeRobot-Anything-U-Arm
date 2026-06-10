@@ -11,7 +11,7 @@ python src/simulation/rollout_sim.py \
     --policy-mode openpi \
     --host localhost \
     --port 8000 \
-    --prompt "put red box to blue plate" \
+    --prompt "put red box to yellow plate" \
     --open-loop-horizon 10 \
     --action-mode absolute \
     --render-mode sensors \
