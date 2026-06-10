@@ -1,12 +1,25 @@
 import argparse
 import json
 import os
+import sys
 import time
 from pathlib import Path
 
 import numpy as np
 
 from rollout_sim import DEFAULT_INITIAL_STATE, ZeroActionRolloutSim, normalize_shader_pack
+try:
+    from sim_env_base import (
+        SUPPORTED_EVAL_BOX_COLORS,
+        SUPPORTED_PLATE_COLORS,
+        resolve_task_prompt_and_target,
+    )
+except ModuleNotFoundError:
+    from .sim_env_base import (
+        SUPPORTED_EVAL_BOX_COLORS,
+        SUPPORTED_PLATE_COLORS,
+        resolve_task_prompt_and_target,
+    )
 
 
 def parse_args():
@@ -23,7 +36,26 @@ def parse_args():
     parser.add_argument("--host", type=str, default="localhost")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--api-key", type=str, default=None)
-    parser.add_argument("--prompt", type=str, default="put red box to blue plate")
+    parser.add_argument(
+        "--prompt",
+        type=str,
+        default=None,
+        help="Language instruction sent to OpenPI. Defaults to target-box/target-plate.",
+    )
+    parser.add_argument(
+        "--target-box",
+        type=str,
+        default="red",
+        choices=SUPPORTED_EVAL_BOX_COLORS,
+        help="Box color to evaluate; currently only red is spawned for eval",
+    )
+    parser.add_argument(
+        "--target-plate",
+        type=str,
+        default="blue",
+        choices=SUPPORTED_PLATE_COLORS,
+        help="Plate color used to build the prompt and success target",
+    )
     parser.add_argument("--open-loop-horizon", type=int, default=10)
     parser.add_argument("--image-size", type=int, default=224)
     parser.add_argument(
@@ -94,12 +126,33 @@ def parse_args():
         default="d435_top_camera,wrist_camera",
         help="Comma-separated sensor camera names to save at the end of each episode",
     )
-    parser.add_argument("--output-dir", type=str, default="eval_results/openpi_rollout_eval")
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        help="Directory for results; defaults to eval_results/random_task/<target>_plate",
+    )
     parser.add_argument("--debug-timing", action="store_true")
     parser.add_argument("--debug-interval", type=int, default=30)
     parser.add_argument("--debug-warmup", type=int, default=5)
     parser.add_argument("--debug-action-interval", type=int, default=0)
-    return parser.parse_args()
+    args = parser.parse_args()
+    explicit_target_box = any(
+        arg == "--target-box" or arg.startswith("--target-box=") for arg in sys.argv
+    )
+    explicit_target_plate = any(
+        arg == "--target-plate" or arg.startswith("--target-plate=") for arg in sys.argv
+    )
+    args.prompt, args.target_box, args.target_plate = resolve_task_prompt_and_target(
+        args.prompt,
+        args.target_box,
+        args.target_plate,
+        explicit_target_box=explicit_target_box,
+        explicit_target_plate=explicit_target_plate,
+    )
+    if args.output_dir is None:
+        args.output_dir = f"eval_results/random_task/{args.target_plate}_plate"
+    return args
 
 
 def force_norm_between(sim: ZeroActionRolloutSim, actor_a, actor_b) -> float:
@@ -165,6 +218,10 @@ def make_policy_client(args):
 def run_episode(sim: ZeroActionRolloutSim, args, policy_client, episode_index: int):
     sim.stop_event.clear()
     sim.task = args.prompt
+    sim.current_task_box_color = args.target_box
+    sim.current_task_plate_color = args.target_plate
+    sim.current_task_box_actor_name = f"{args.target_box}_box"
+    sim.current_task_plate_actor_name = f"{args.target_plate}_plate"
     sim._set_initial_robot_state()
     sim._randomize_task_objects()
 
@@ -179,9 +236,12 @@ def run_episode(sim: ZeroActionRolloutSim, args, policy_client, episode_index: i
     period = max(1.0 / args.rate, 1e-6)
     next_time = time.monotonic()
 
-    blue_plate = sim.plates[0] if sim.plates else None
-    if sim.grasp_object is None or blue_plate is None:
-        raise RuntimeError("Evaluation requires the red box and blue plate actors")
+    target_plate = sim.plate_color_to_actor.get(args.target_plate)
+    if sim.grasp_object is None or target_plate is None:
+        raise RuntimeError(
+            f"Evaluation requires the {args.target_box} box and "
+            f"{args.target_plate} plate actors"
+        )
 
     while step_count < args.max_steps:
         if args.policy_mode == "zero":
@@ -212,7 +272,7 @@ def run_episode(sim: ZeroActionRolloutSim, args, policy_client, episode_index: i
 
         sim.rollout_step(env_action)
         step_count += 1
-        contact_force = force_norm_between(sim, sim.grasp_object, blue_plate)
+        contact_force = force_norm_between(sim, sim.grasp_object, target_plate)
         max_contact_force = max(max_contact_force, contact_force)
         if not success and contact_force > args.success_contact_force_threshold:
             success = True
@@ -253,6 +313,9 @@ def run_episode(sim: ZeroActionRolloutSim, args, policy_client, episode_index: i
     return {
         "episode": episode_index,
         "steps": step_count,
+        "target_box_color": args.target_box,
+        "target_plate_color": args.target_plate,
+        "prompt": args.prompt,
         "success": success,
         "first_success_step": first_success_step,
         "max_contact_force": max_contact_force,
@@ -310,8 +373,9 @@ def main():
     if args.policy_mode == "openpi":
         print(f"OpenPI server: {args.host}:{args.port}")
         print(f"Open-loop horizon: {args.open_loop_horizon}")
-        print(f"Action mode: {args.action_mode}")
+    print(f"Action mode: {args.action_mode}")
     print(f"Prompt: {args.prompt}")
+    print(f"Target: {args.target_box} box -> {args.target_plate} plate")
     print(f"Render mode: {args.render_mode}")
     print(f"Env render: {'enabled' if args.env_render else 'disabled'}")
     print(f"Live camera display: {'enabled' if args.display_cameras or args.visualize else 'disabled'}")

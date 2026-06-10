@@ -16,6 +16,11 @@ from transforms3d.euler import euler2quat
 from mani_skill.utils.building import actors
 
 try:
+    from sim_env_base import (
+        SUPPORTED_EVAL_BOX_COLORS,
+        SUPPORTED_PLATE_COLORS,
+        resolve_task_prompt_and_target,
+    )
     from teleop_sim import (
         ServoTeleoperatorSim,
         build_camera_shader_config,
@@ -24,6 +29,11 @@ try:
         SHADER_PACK_ALIASES,
     )
 except ModuleNotFoundError:
+    from .sim_env_base import (
+        SUPPORTED_EVAL_BOX_COLORS,
+        SUPPORTED_PLATE_COLORS,
+        resolve_task_prompt_and_target,
+    )
     from .teleop_sim import (
         ServoTeleoperatorSim,
         build_camera_shader_config,
@@ -962,8 +972,22 @@ def parse_args():
     parser.add_argument(
         "--prompt",
         type=str,
-        default="put red box to blue plate",
-        help="Language instruction sent to OpenPI policy server",
+        default=None,
+        help="Language instruction sent to OpenPI. Defaults to target-box/target-plate.",
+    )
+    parser.add_argument(
+        "--target-box",
+        type=str,
+        default="red",
+        choices=SUPPORTED_EVAL_BOX_COLORS,
+        help="Box color for the generated prompt; currently only red is spawned for rollout",
+    )
+    parser.add_argument(
+        "--target-plate",
+        type=str,
+        default="blue",
+        choices=SUPPORTED_PLATE_COLORS,
+        help="Plate color for the generated prompt",
     )
     parser.add_argument(
         "--open-loop-horizon",
@@ -1115,7 +1139,21 @@ def parse_args():
     parser.add_argument("--record-cameras", type=str, default="d435_top_camera,wrist_camera")
     parser.add_argument("--record-fps", type=int, default=30)
     parser.add_argument("--save-on-exit", action=argparse.BooleanOptionalAction, default=True)
-    return parser.parse_args()
+    args = parser.parse_args()
+    explicit_target_box = any(
+        arg == "--target-box" or arg.startswith("--target-box=") for arg in sys.argv
+    )
+    explicit_target_plate = any(
+        arg == "--target-plate" or arg.startswith("--target-plate=") for arg in sys.argv
+    )
+    args.prompt, args.target_box, args.target_plate = resolve_task_prompt_and_target(
+        args.prompt,
+        args.target_box,
+        args.target_plate,
+        explicit_target_box=explicit_target_box,
+        explicit_target_plate=explicit_target_plate,
+    )
+    return args
 
 
 def wait_for_human_start(sim: ZeroActionRolloutSim, enabled: bool, policy_mode: str):
@@ -1179,6 +1217,7 @@ def main():
         print(f"Policy image size: {args.image_size}")
         print(f"Action mode: {args.action_mode}")
     print(f"Prompt: {args.prompt}")
+    print(f"Target: {args.target_box} box -> {args.target_plate} plate")
     print(f"Render mode: {args.render_mode}")
     print(f"Env render: {'enabled' if args.env_render else 'disabled'}")
     print(f"Shader pack: {args.shader_pack} ({normalize_shader_pack(args.shader_pack)})")
